@@ -30,79 +30,78 @@ function Write-TextUtf8NoBom([string]$Path, [string]$Text) {
   [System.IO.File]::WriteAllText($Path, $Text, $enc)
 }
 
-# --- Resolve repo root ---
+# Resolve repo root
 if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
   $RepoRoot = Find-RepoRoot (Get-Location).Path
 } else {
   $RepoRoot = Find-RepoRoot $RepoRoot
 }
-if (-not $RepoRoot) { throw "Could not find repo root (package.json). Run from repo root." }
+if (-not $RepoRoot) { throw "Could not find repo root (package.json)." }
 Write-Host "RepoRoot: $RepoRoot"
 
-# --------------------------------------------------
-# 1) Clean PowerShell garbage out of backtest/page.js
-# --------------------------------------------------
 $btPage = Join-Path $RepoRoot "src/app/backtest/page.js"
-if (Test-Path $btPage) {
-  $text = Read-TextUtf8 $btPage
-  $orig = $text
-
-  # Remove any top-of-file PowerShell block that contains param($m) / $inside / -match
-  $text = [regex]::Replace(
-    $text,
-    '^(?:.*param\(\$m\).*\r?\n.*\$inside\s*=\s*\$m\.Groups\[1\]\.Value.*\r?\n.*-match\s*''\(\^|\,\)\\s\*useEffect\\s\*\(,|\$\)''.*\r?\n.*return\s*''import\s*\{.*useEffect.*?;''.*\r?\n\s*)',
-    '',
-    [System.Text.RegularExpressions.RegexOptions]::Singleline
-  )
-
-  if ($text -ne $orig) {
-    $bak = Backup-File $btPage
-    Write-Host "Cleaned PowerShell noise from: $btPage"
-    Write-Host "Backup: $bak"
-    Write-TextUtf8NoBom $btPage $text
-  } else {
-    Write-Host "No PowerShell noise detected in: $btPage"
-  }
-} else {
-  Write-Host "WARNING: backtest/page.js not found at $btPage"
+if (-not (Test-Path $btPage)) {
+  throw "src/app/backtest/page.js not found"
 }
 
-# --------------------------------------------------
-# 2) Remove "Start price" column from BacktestEngine
-# --------------------------------------------------
-$engine = Get-ChildItem -Path $RepoRoot -Recurse -File -Filter "BacktestEngine.js" -ErrorAction SilentlyContinue |
-  Select-Object -First 1
+$text = Read-TextUtf8 $btPage
+$orig = $text
 
-if ($engine) {
-  $t = Read-TextUtf8 $engine.FullName
-  $orig = $t
-
-  # Remove header cell
-  $t = [regex]::Replace(
-    $t,
-    '<th className="text-right pr-4">Start price</th>\s*',
-    '',
-    [System.Text.RegularExpressions.RegexOptions]::Singleline
-  )
-
-  # Remove body cell that renders avgStartPriceLabel
-  $t = [regex]::Replace(
-    $t,
-    '<td className="text-right pr-4">\{r\.avgStartPriceLabel\}</td>\s*',
-    '',
-    [System.Text.RegularExpressions.RegexOptions]::Singleline
-  )
-
-  if ($t -ne $orig) {
-    $bak2 = Backup-File $engine.FullName
-    Write-Host "Removed Start price column in: $($engine.FullName)"
-    Write-Host "Backup: $bak2"
-    Write-TextUtf8NoBom $engine.FullName $t
-  } else {
-    Write-Host "No Start price column pattern found in: $($engine.FullName)"
+# Ensure React import has useEffect
+$text = [regex]::Replace(
+  $text,
+  'import\s*\{\s*([^}]*)\}\s*from\s*["'']react["''];',
+  {
+    param($m)
+    $inside = $m.Groups[1].Value
+    if ($inside -match '(^|,)\s*useEffect\s*(,|$)') { return $m.Value }
+    return 'import { ' + $inside.Trim() + ', useEffect } from "react";'
   }
+)
+
+# Inject combined auto-click effect if not already present
+if ($text -notmatch 'PM_AUTOLOAD_BROWSER_AND_RUN') {
+  $effect = @'
+  // PM_AUTOLOAD_BROWSER_AND_RUN: auto-click "Load from This Browser" then "Run Backtest"
+  useEffect(() => {
+    const t1 = setTimeout(() => {
+      try {
+        const loadBtn = document.querySelector('button[data-auto-load="browser"]');
+        if (loadBtn) loadBtn.click();
+      } catch {}
+    }, 3000);
+
+    const t2 = setTimeout(() => {
+      try {
+        const runBtn = Array.from(document.querySelectorAll("button"))
+          .find(b => /Run Backtest/i.test(b.textContent || ""));
+        if (runBtn) runBtn.click();
+      } catch {}
+    }, 4500);
+
+    return () => {
+      clearTimeout(t1);
+      clearTimeout(t2);
+    };
+  }, []);
+
+'@
+
+  $text = [regex]::Replace(
+    $text,
+    '(export\s+default\s+function\s+[A-Za-z0-9_]+\s*\([^)]*\)\s*\{\s*)',
+    ('$1' + $effect),
+    [System.Text.RegularExpressions.RegexOptions]::Singleline
+  )
+}
+
+if ($text -ne $orig) {
+  $bak = Backup-File $btPage
+  Write-Host "Patched backtest/page.js (auto-click load + run)"
+  Write-Host "Backup: $bak"
+  Write-TextUtf8NoBom $btPage $text
 } else {
-  Write-Host "WARNING: BacktestEngine.js not found."
+  Write-Host "No changes applied (pattern not found or already patched)."
 }
 
 Write-Host "Done."

@@ -6,29 +6,7 @@ import BacktestEngine from "../../components/BacktestEngine";
 import ThemeToggle from "../../components/ThemeToggle";
 
 export default function BacktestPage() {
-    // PM_AUTOLOAD_BROWSER_AND_RUN: auto-click "Load from This Browser" then "Run Backtest"
-  useEffect(() => {
-    const t1 = setTimeout(() => {
-      try {
-        const loadBtn = document.querySelector('button[data-auto-load="browser"]');
-        if (loadBtn) loadBtn.click();
-      } catch {}
-    }, 3000);
-
-    const t2 = setTimeout(() => {
-      try {
-        const runBtn = Array.from(document.querySelectorAll("button"))
-          .find(b => /Run Backtest/i.test(b.textContent || ""));
-        if (runBtn) runBtn.click();
-      } catch {}
-    }, 4500);
-
-    return () => {
-      clearTimeout(t1);
-      clearTimeout(t2);
-    };
-  }, []);
-// PM_AUTOLOAD_BROWSER_BTN: auto-click "Load from this Browser" after 3s
+  // PM_AUTOLOAD_BROWSER_BTN: auto-click "Load from this Browser" after 3s
   useEffect(() => {
     const t = setTimeout(() => {
       try {
