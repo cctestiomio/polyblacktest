@@ -1,11 +1,13 @@
-# patch.ps1
-# Fixes LiveTracker to determine outcome by final price and auto-advance.
+# fix_tracker.ps1
+# Fixes LiveTracker.js syntax error by correctly escaping backticks
 
 $ErrorActionPreference = "Stop"
 
 Write-Host "Patching LiveTracker.js..." -ForegroundColor Cyan
 
-# Define the new content for LiveTracker.js
+# We use the backtick character (`) to escape the backtick character in PowerShell strings.
+# So `` becomes ` in the final file.
+
 $liveTrackerContent = @"
 "use client";
 import { useEffect, useRef, useState, useCallback } from "react";
@@ -19,7 +21,7 @@ import {
 const WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 
 function pad(n) { return String(n).padStart(2, "0"); }
-function fmtS(s) { return `${pad(Math.floor(s / 60))}:${pad(s % 60)}`; }
+function fmtS(s) { return ``${pad(Math.floor(s / 60))}:${pad(s % 60)}``; }
 
 export default function LiveTracker({ onSaveSession }) {
   const [status,       setStatus]       = useState("idle");
@@ -142,7 +144,6 @@ export default function LiveTracker({ onSaveSession }) {
     setRemaining(rem);
 
     const { up, down } = pricesRef.current;
-    // Only record if we have data or preserve previous
     const lastP = historyRef.current[historyRef.current.length - 1];
     const point = { 
       t: Math.floor(Date.now() / 1000), 
@@ -160,31 +161,28 @@ export default function LiveTracker({ onSaveSession }) {
       clearInterval(tickRef.current);
       tickRef.current = null;
       
-      // Close WS immediately
       if (wsRef.current) { wsRef.current.onclose = null; wsRef.current.close(); wsRef.current = null; }
       setWsState("disconnected");
 
-      // 1. Determine Winner Locally by Final Price
-      // If UP > DOWN (or UP > 0.5), UP wins.
+      // Determine Winner Locally
       const finalUp = point.up || 0;
       const finalDown = point.down || 0;
       
       let localOutcome = "UNKNOWN";
       if (finalUp > finalDown) localOutcome = "UP";
       else if (finalDown > finalUp) localOutcome = "DOWN";
-      else localOutcome = "UP"; // Tie-breaker fallback (rare)
+      else localOutcome = "UP"; 
 
       setStatus("resolved");
       setOutcome(localOutcome);
-      setOutcomeConf(true); // We trust our local data
+      setOutcomeConf(true); 
       setResolving(false);
 
-      // 2. Save Session
       doSave(next, localOutcome);
 
-      // 3. Auto-Advance to Next Slug (next 5m bucket)
+      // Auto-Advance
       const nextSlugTs = slugTs + 300;
-      setNextIn(5); // Show 5s countdown
+      setNextIn(5); 
 
       let count = 5;
       cdRef.current = setInterval(() => {
@@ -224,22 +222,18 @@ export default function LiveTracker({ onSaveSession }) {
 
     const m = await fetchMarketBySlug(slug);
     
-    // Handle market missing (likely next one hasn't been created by API yet)
     if (!m || m.error) {
-       // If we are trying to load the FUTURE market and it fails, 
-       // retry automatically in 2 seconds
        if (slugTs > (Date.now()/1000)) {
-          setErrorMsg(`Waiting for market creation: ${slug}`);
+          setErrorMsg(``Waiting for market creation: ${slug}``);
           setTimeout(() => startTracking(slugOverride, slugTsOverride), 2000);
           return;
        }
-       setErrorMsg(`Market not found: ${slug}`);
+       setErrorMsg(``Market not found: ${slug}``);
        setStatus("error");
        setQuestion("");
        return;
     }
 
-    // If market already resolved (loading old one)
     if (m.closed && m.winner) {
       const w = m.winner.toLowerCase();
       const det = w === "up" ? "UP" : w === "down" ? "DOWN" : null;
@@ -300,14 +294,14 @@ export default function LiveTracker({ onSaveSession }) {
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
             <p className="text-xs font-mono text-slate-400 dark:text-slate-500 truncate">{slugLabel || "Searching..."}</p>
-            <span className={`text-xs font-semibold ${wsColor}`}>
+            <span className={``text-xs font-semibold ${wsColor}``}>
               {wsState === "connected" ? "● WS" : wsState === "error" ? "● WS ERR" : "○ WS"}
             </span>
           </div>
           <p className="text-sm text-slate-700 dark:text-slate-300 truncate">{question}</p>
         </div>
         <div className="flex gap-2 items-center shrink-0">
-          <span className={`px-2 py-0.5 rounded text-xs font-bold ${statusColor}`}>{status.toUpperCase()}</span>
+          <span className={``px-2 py-0.5 rounded text-xs font-bold ${statusColor}``}>{status.toUpperCase()}</span>
           <button onClick={() => startTracking()}
             className="px-3 py-1 bg-indigo-600 hover:bg-indigo-500 text-white rounded text-xs font-semibold">
             Refresh
@@ -339,23 +333,23 @@ export default function LiveTracker({ onSaveSession }) {
 
       {/* Stats */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-        <StatCard label="UP Price"   value={curUp   != null ? `${(curUp*100).toFixed(1)}c`   : "---"} color="text-green-600 dark:text-green-400" />
-        <StatCard label="DOWN Price" value={curDown != null ? `${(curDown*100).toFixed(1)}c` : "---"} color="text-red-600 dark:text-red-400" />
+        <StatCard label="UP Price"   value={curUp   != null ? ``${(curUp*100).toFixed(1)}c``   : "---"} color="text-green-600 dark:text-green-400" />
+        <StatCard label="DOWN Price" value={curDown != null ? ``${(curDown*100).toFixed(1)}c`` : "---"} color="text-red-600 dark:text-red-400" />
         <StatCard label="Elapsed"    value={fmtS(elapsed)}   color="text-blue-600 dark:text-blue-400" />
         <StatCard label="Remaining"  value={fmtS(remaining)} color="text-orange-500 dark:text-orange-400" />
       </div>
 
       {/* Resolved banner */}
       {status === "resolved" && (
-        <div className={`rounded-xl p-4 text-center border ${
+        <div className={``rounded-xl p-4 text-center border ${
             outcome === "UP"
             ? "bg-green-50 dark:bg-green-900/30 border-green-200 dark:border-green-800"
             : outcome === "DOWN"
             ? "bg-red-50 dark:bg-red-900/30 border-red-200 dark:border-red-800"
             : "bg-slate-50 dark:bg-slate-800 border-slate-200"
-        }`}>
+        }``}>
             <div>
-              <p className={`font-bold text-xl ${outcome === "UP" ? "text-green-700 dark:text-green-300" : outcome === "DOWN" ? "text-red-700 dark:text-red-300" : "text-slate-600"}`}>
+              <p className={``font-bold text-xl ${outcome === "UP" ? "text-green-700 dark:text-green-300" : outcome === "DOWN" ? "text-red-700 dark:text-red-300" : "text-slate-600"}``}>
                 {outcome === "UP"   && "▲ RESOLVED UP"}
                 {outcome === "DOWN" && "▼ RESOLVED DOWN"}
                 {!outcome           && "UNKNOWN RESULT"}
@@ -385,11 +379,11 @@ export default function LiveTracker({ onSaveSession }) {
           <ResponsiveContainer width="100%" height="100%">
             <LineChart data={chartData}>
               <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
-              <XAxis dataKey="elapsed" tickFormatter={v => `${v}s`} stroke="#94a3b8" tick={{ fontSize: 11 }} interval="preserveStartEnd" />
-              <YAxis domain={[0, 100]} tickFormatter={v => `${v}c`} stroke="#94a3b8" tick={{ fontSize: 11 }} />
+              <XAxis dataKey="elapsed" tickFormatter={v => ``${v}s``} stroke="#94a3b8" tick={{ fontSize: 11 }} interval="preserveStartEnd" />
+              <YAxis domain={[0, 100]} tickFormatter={v => ``${v}c``} stroke="#94a3b8" tick={{ fontSize: 11 }} />
               <Tooltip
-                formatter={(v, n) => [v != null ? `${v}c` : "---", n]}
-                labelFormatter={v => `${v}s elapsed`}
+                formatter={(v, n) => [v != null ? ``${v}c`` : "---", n]}
+                labelFormatter={v => ``${v}s elapsed``}
                 contentStyle={{ background: "#fff", border: "1px solid #e2e8f0", borderRadius: 8, color: "#0f172a", fontSize: 12 }}
               />
               <ReferenceLine y={50} stroke="#94a3b8" strokeDasharray="4 2" />
@@ -417,21 +411,13 @@ function StatCard({ label, value, color }) {
   return (
     <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-3 text-center shadow-sm">
       <p className="text-xs text-slate-400 mb-1">{label}</p>
-      <p className={`text-xl font-bold font-mono ${color}`}>{value}</p>
+      <p className={``text-xl font-bold font-mono ${color}``}>{value}</p>
     </div>
   );
 }
 "@
 
-# Path strategy: look for "src/components" or "components"
+# Path strategy
 if (Test-Path "src/components/LiveTracker.js") {
     Set-Content -Path "src/components/LiveTracker.js" -Value $liveTrackerContent -Encoding UTF8
-    Write-Host "Success: src/components/LiveTracker.js updated." -ForegroundColor Green
-} elseif (Test-Path "components/LiveTracker.js") {
-    Set-Content -Path "components/LiveTracker.js" -Value $liveTrackerContent -Encoding UTF8
-    Write-Host "Success: components/LiveTracker.js updated." -ForegroundColor Green
-} else {
-    Write-Host "Error: Could not find LiveTracker.js in 'components' or 'src/components'. Please place this script in your project root." -ForegroundColor Red
-}
-
-Write-Host "Patch complete." -ForegroundColor Cyan
+    Write-Host
