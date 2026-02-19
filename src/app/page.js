@@ -5,7 +5,6 @@ import LiveTracker from "../components/LiveTracker";
 import ThemeToggle from "../components/ThemeToggle";
 
 const STORAGE_KEY = "pm_sessions";
-
 function loadSessions() {
   if (typeof window === "undefined") return [];
   try { return JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "[]"); } catch { return []; }
@@ -16,10 +15,7 @@ export default function Home() {
   const [sessions, setSessions] = useState(() => loadSessions());
   const [toastMsg, setToastMsg] = useState(null);
 
-  const showToast = (msg) => {
-    setToastMsg(msg);
-    setTimeout(() => setToastMsg(null), 3000);
-  };
+  const showToast = (msg) => { setToastMsg(msg); setTimeout(() => setToastMsg(null), 3000); };
 
   const onSaveSession = useCallback((session) => {
     setSessions(prev => {
@@ -27,11 +23,21 @@ export default function Home() {
       saveSessions(next);
       return next;
     });
-    showToast(`✅ Saved: ${session.slug} (${session.priceHistory.length} pts) — Outcome: ${session.outcome ?? "unknown"}`);
+    showToast(`Saved: ${session.slug} - Outcome: ${session.outcome ?? "unknown"}`);
+  }, []);
+
+  // Manual outcome override for any saved session
+  const overrideOutcome = useCallback((slug, outcome) => {
+    setSessions(prev => {
+      const next = prev.map(s => s.slug === slug ? { ...s, outcome } : s);
+      saveSessions(next);
+      return next;
+    });
+    showToast(`Updated ${slug.replace("btc-updown-5m-","")} -> ${outcome}`);
   }, []);
 
   const downloadSessions = () => {
-    if (sessions.length === 0) return;
+    if (!sessions.length) return;
     const blob = new Blob([JSON.stringify(sessions, null, 2)], { type: "application/json" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
@@ -47,20 +53,18 @@ export default function Home() {
 
   return (
     <div className="min-h-screen bg-[var(--bg)] text-[var(--text1)]">
-      {/* Toast */}
       {toastMsg && (
         <div className="fixed top-4 right-4 z-50 bg-indigo-600 text-white text-sm font-medium px-4 py-3 rounded-xl shadow-lg max-w-sm">
           {toastMsg}
         </div>
       )}
 
-      {/* Nav */}
       <nav className="border-b border-[var(--border)] bg-[var(--nav)] backdrop-blur sticky top-0 z-10">
         <div className="max-w-5xl mx-auto px-4 py-3 flex items-center gap-4">
-          <span className="font-bold text-lg">⚡ PM BTC 5m</span>
+          <span className="font-bold text-lg">PM BTC 5m</span>
           <span className="text-[var(--text2)] text-sm hidden sm:block">Polymarket Tracker & Backtest</span>
           <div className="ml-auto flex gap-3 items-center">
-            <Link href="/" className="text-sm font-semibold text-indigo-600 dark:text-indigo-400">Live</Link>
+            <Link href="/"         className="text-sm font-semibold text-indigo-600 dark:text-indigo-400">Live</Link>
             <Link href="/backtest" className="text-sm text-[var(--text2)] hover:text-[var(--text1)]">Backtest</Link>
             <ThemeToggle />
           </div>
@@ -68,45 +72,62 @@ export default function Home() {
       </nav>
 
       <main className="max-w-5xl mx-auto px-4 py-6 space-y-6">
-        {/* Live tracker */}
         <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-5 shadow-sm">
-          <h1 className="text-lg font-bold mb-4">🔴 Live Tracker</h1>
+          <h1 className="text-lg font-bold mb-4">Live Tracker</h1>
           <LiveTracker onSaveSession={onSaveSession} />
         </div>
 
-        {/* Saved sessions */}
         <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-5 shadow-sm">
           <div className="flex items-center gap-3 mb-4">
             <h2 className="text-lg font-bold">Saved Sessions ({sessions.length})</h2>
             <div className="ml-auto flex gap-2">
-              <button onClick={downloadSessions} disabled={sessions.length === 0}
+              <button onClick={downloadSessions} disabled={!sessions.length}
                 className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-lg text-sm font-semibold">
-                ⬇ Download JSON
+                Download JSON
               </button>
-              <button onClick={clearSessions} disabled={sessions.length === 0}
+              <button onClick={clearSessions} disabled={!sessions.length}
                 className="px-4 py-1.5 bg-red-100 hover:bg-red-200 dark:bg-red-900/50 dark:hover:bg-red-900 disabled:opacity-40 text-red-700 dark:text-red-400 rounded-lg text-sm font-semibold">
                 Clear
               </button>
             </div>
           </div>
-          {sessions.length === 0 ? (
-            <p className="text-[var(--text3)] text-sm">No sessions saved yet. Track a market — it auto-saves when the market resolves.</p>
+
+          {!sessions.length ? (
+            <p className="text-[var(--text3)] text-sm">No sessions yet. Markets auto-save on resolution.</p>
           ) : (
-            <div className="space-y-2 max-h-64 overflow-y-auto">
+            <div className="space-y-2 max-h-96 overflow-y-auto">
               {[...sessions].reverse().map((s, i) => (
-                <div key={i} className="flex items-center gap-3 bg-[var(--bg2)] rounded-lg px-3 py-2 text-sm">
-                  <span className="font-mono text-[var(--text3)] truncate flex-1">{s.slug}</span>
-                  <span className="text-[var(--text3)]">{s.priceHistory?.length ?? 0} pts</span>
-                  {s.outcome ? (
-                    <span className={`font-bold ${s.outcome==="UP"?"text-green-600 dark:text-green-400":"text-red-600 dark:text-red-400"}`}>
-                      {s.outcome === "UP" ? "▲" : "▼"} {s.outcome}
-                    </span>
-                  ) : (
-                    <span className="text-[var(--text3)]">—</span>
-                  )}
+                <div key={i} className="flex items-center gap-3 bg-[var(--bg2)] rounded-lg px-3 py-2">
+                  <span className="font-mono text-xs text-[var(--text3)] truncate flex-1">{s.slug}</span>
+                  <span className="text-xs text-[var(--text3)] shrink-0">{s.priceHistory?.length ?? 0} pts</span>
+
+                  {/* Manual outcome override buttons */}
+                  <div className="flex gap-1 shrink-0">
+                    <button
+                      onClick={() => overrideOutcome(s.slug, "UP")}
+                      className={`px-2 py-0.5 rounded text-xs font-bold border transition ${
+                        s.outcome === "UP"
+                          ? "bg-green-500 text-white border-green-500"
+                          : "bg-transparent border-green-400 text-green-600 dark:text-green-400 hover:bg-green-50 dark:hover:bg-green-900/30"
+                      }`}
+                    >UP</button>
+                    <button
+                      onClick={() => overrideOutcome(s.slug, "DOWN")}
+                      className={`px-2 py-0.5 rounded text-xs font-bold border transition ${
+                        s.outcome === "DOWN"
+                          ? "bg-red-500 text-white border-red-500"
+                          : "bg-transparent border-red-400 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/30"
+                      }`}
+                    >DOWN</button>
+                  </div>
                 </div>
               ))}
             </div>
+          )}
+          {sessions.length > 0 && (
+            <p className="text-xs text-[var(--text3)] mt-3">
+              Click UP / DOWN on any row to correct its outcome before running a backtest.
+            </p>
           )}
         </div>
       </main>
