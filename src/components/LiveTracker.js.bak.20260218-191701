@@ -10,7 +10,7 @@ import {
 const WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 
 function pad(n) { return String(n).padStart(2, "0"); }
-function fmtS(s) { const m = Math.floor(s / 60); const sec = Math.floor(s % 60); return `${pad(m)}:${pad(sec)}`; }
+function fmtS(s) { return ${pad(Math.floor(s / 60))}:; }
 
 export default function LiveTracker({ onSaveSession }) {
   const [status,       setStatus]       = useState("idle");
@@ -220,11 +220,11 @@ export default function LiveTracker({ onSaveSession }) {
        // If we are trying to load the FUTURE market and it fails, 
        // retry automatically in 2 seconds
        if (slugTs > (Date.now()/1000)) {
-          setErrorMsg("Waiting for market creation...");
+          setErrorMsg(Waiting for market creation: );
           setTimeout(() => startTracking(slugOverride, slugTsOverride), 2000);
           return;
        }
-       setErrorMsg("Market not found");
+       setErrorMsg(Market not found: );
        setStatus("error");
        setQuestion("");
        return;
