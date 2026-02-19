@@ -330,8 +330,8 @@ export default function LiveTracker({ onSaveSession }) {
 
       {/* Stats */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-        <StatCard label="UP Price"   value={curUp != null ? (curUp*100).toFixed(1) + "c" : "---"} color="text-green-600 dark:text-green-400" />
-        <StatCard label="DOWN Price" value={curDown != null ? (curDown*100).toFixed(1) + "c" : "---"} color="text-red-600 dark:text-red-400" />
+        <StatCard label="UP Price"   value={curUp   != null ? ${(curUp*100).toFixed(1)}c   : "---"} color="text-green-600 dark:text-green-400" />
+        <StatCard label="DOWN Price" value={curDown != null ? ${(curDown*100).toFixed(1)}c : "---"} color="text-red-600 dark:text-red-400" />
         <StatCard label="Elapsed"    value={fmtS(elapsed)}   color="text-blue-600 dark:text-blue-400" />
         <StatCard label="Remaining"  value={fmtS(remaining)} color="text-orange-500 dark:text-orange-400" />
       </div>

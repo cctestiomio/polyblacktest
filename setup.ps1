@@ -1,9 +1,7 @@
-<# patch-livetracker-classname.ps1
-   Fixes broken JSX like:
-     <span className={ ext-xs font-semibold }>
-   into:
-     <span className="text-xs font-semibold">
-   (also fixes "ext-" -> "text-" inside those unquoted class lists)
+<# patch-livetracker-stats.ps1
+   Fixes invalid JSX in LiveTracker.js like:
+     value={curUp != null ? ${(curUp*100).toFixed(1)}c : "---"}
+   -> value={curUp != null ? (curUp*100).toFixed(1) + "c" : "---"}
 #>
 
 param(
@@ -21,26 +19,15 @@ if (-not (Test-Path $target)) {
 $content  = Get-Content -Path $target -Raw -Encoding UTF8
 $original = $content
 
-# Replace className={ <tailwind classes> } (unquoted) -> className="<tailwind classes>"
-# Safety rules:
-# - must contain at least 2 tokens (space)
-# - must contain at least one hyphen (tailwind-ish)
-# - must NOT already contain quotes/backticks/$ (avoid touching real JS expressions)
-$pattern = 'className\s*=\s*\{\s*([A-Za-z0-9:\/\.\-\s]+)\s*\}'
+# UP price StatCard value fix
+$patternUp = 'value=\{\s*curUp\s*!=\s*null\s*\?\s*\$\{\s*\(\s*curUp\s*\*\s*100\s*\)\s*\.toFixed\(\s*1\s*\)\s*\}\s*c\s*:\s*("|\x27)---\1\s*\}'
+$replaceUp = 'value={curUp != null ? (curUp*100).toFixed(1) + "c" : "---"}'
+$content = [regex]::Replace($content, $patternUp, $replaceUp)
 
-$content = [regex]::Replace($content, $pattern, {
-  param($m)
-  $cls = $m.Groups[1].Value.Trim()
-
-  if ($cls -match '["''`$]') { return $m.Value }
-  if ($cls -notmatch '\s')   { return $m.Value }
-  if ($cls -notmatch '-')    { return $m.Value }
-
-  # Fix common typo: ext-xs -> text-xs, ext-sm -> text-sm, etc.
-  $cls2 = ($cls -replace '\bext-', 'text-')
-
-  return 'className="' + $cls2 + '"'
-})
+# DOWN price StatCard value fix
+$patternDown = 'value=\{\s*curDown\s*!=\s*null\s*\?\s*\$\{\s*\(\s*curDown\s*\*\s*100\s*\)\s*\.toFixed\(\s*1\s*\)\s*\}\s*c\s*:\s*("|\x27)---\1\s*\}'
+$replaceDown = 'value={curDown != null ? (curDown*100).toFixed(1) + "c" : "---"}'
+$content = [regex]::Replace($content, $patternDown, $replaceDown)
 
 if ($content -eq $original) {
   Write-Host "No changes made (pattern not found or already fixed)."
