@@ -47,11 +47,24 @@ function profitPerBet(stake, avgPrice01) {
   return { stake: s, shares, profitIfWinEach, lossIfLoseEach };
 }
 
+// Delta vs start (Price To Beat) expressed in "$ profit-if-win difference" for $stake:
+// delta = (stake/current - stake) - (stake/start - stake) = stake*(1/current - 1/start)
+function deltaProfitIfWin(stake, startPrice01, curPrice01) {
+  const s = Math.max(0, Number(stake) || 0);
+  const p0 = clamp(startPrice01, 0.01, 0.99);
+  const p1 = clamp(curPrice01, 0.01, 0.99);
+  return s * ((1 / p1) - (1 / p0));
+}
+
 function colorForMetric(sortBy, value) {
+  // Simple red->yellow->green ramp
+  // winrate: 0..100, roi: -100..100, pl: -200..200, delta: -200..200
   let t = 0.5;
+
   if (sortBy === "winrate") t = clamp(value / 100, 0, 1);
   else if (sortBy === "roi") t = clamp((value + 100) / 200, 0, 1);
-  else t = clamp((value + 10) / 60, 0, 1);
+  else if (sortBy === "delta") t = clamp((value + 200) / 400, 0, 1);
+  else t = clamp((value + 200) / 400, 0, 1);
 
   const hue = (t < 0.5) ? (0 + (t / 0.5) * 55) : (55 + ((t - 0.5) / 0.5) * 65);
   return `hsl(${hue}, 70%, 55%)`;
@@ -62,14 +75,18 @@ export default function BacktestEngine({ sessions }) {
   const [priceMin, setPriceMin] = useState(0.10);
   const [priceMax, setPriceMax] = useState(0.90);
 
-  // REVERSED: remaining-time filter (not elapsed)
+  // Remaining-time filter
   const [remainingMin, setRemainingMin] = useState(0);
   const [remainingMax, setRemainingMax] = useState(WINDOW_SECS);
 
   const [priceStepCents, setPriceStepCents] = useState(5); // 1,5,10
   const [timeStepSecs, setTimeStepSecs] = useState(5);     // 1,5,10
 
-  const [sortBy, setSortBy] = useState("winrate"); // winrate | roi | pl
+  // NEW: price-to-beat delta bucketing
+  const [useDeltaBuckets, setUseDeltaBuckets] = useState(false);
+  const [deltaStepDollars, setDeltaStepDollars] = useState(10); // 5,10,20,50
+
+  const [sortBy, setSortBy] = useState("winrate"); // winrate | roi | pl | delta
   const [topN, setTopN] = useState(50);
   const [minSamples, setMinSamples] = useState(1);
 
@@ -87,17 +104,27 @@ export default function BacktestEngine({ sessions }) {
     const ps = ([1,5,10].includes(Number(priceStepCents)) ? Number(priceStepCents) : 5);
     const ts = ([1,5,10].includes(Number(timeStepSecs)) ? Number(timeStepSecs) : 5);
 
-    const s = (sortBy === "roi" || sortBy === "pl" || sortBy === "winrate") ? sortBy : "winrate";
+    const ds = ([5,10,20,50].includes(Number(deltaStepDollars)) ? Number(deltaStepDollars) : 10);
+
+    const s = (sortBy === "roi" || sortBy === "pl" || sortBy === "winrate" || sortBy === "delta") ? sortBy : "winrate";
 
     return {
       pMin, pMax,
       rMin, rMax,
       ps, ts,
+      useDelta: !!useDeltaBuckets,
+      ds,
       sortBy: s,
       topN: clamp(topN, 1, 500),
       minSamples: clamp(minSamples, 1, 1000000),
     };
-  }, [priceMin, priceMax, remainingMin, remainingMax, priceStepCents, timeStepSecs, sortBy, topN, minSamples]);
+  }, [
+    priceMin, priceMax,
+    remainingMin, remainingMax,
+    priceStepCents, timeStepSecs,
+    useDeltaBuckets, deltaStepDollars,
+    sortBy, topN, minSamples
+  ]);
 
   const runBacktest = () => {
     const sides = buySide === "BOTH" ? ["UP", "DOWN"] : [buySide];
@@ -105,7 +132,7 @@ export default function BacktestEngine({ sessions }) {
     let tradesCount = 0;
     let winsCount = 0;
 
-    // key = side|remStart|centStart
+    // key = side|remStart|centStart(|deltaBucketStart)
     const cells = new Map();
 
     for (const session of sessions) {
@@ -113,13 +140,23 @@ export default function BacktestEngine({ sessions }) {
       if (!outcome) continue;
 
       const points = Array.isArray(session?.priceHistory) ? session.priceHistory : [];
+      if (points.length === 0) continue;
+
+      // Price To Beat (start-of-slug): first recorded price for each side
+      let startUp = null;
+      let startDown = null;
+      for (const p of points) {
+        if (startUp == null && p?.up != null) startUp = Number(p.up);
+        if (startDown == null && p?.down != null) startDown = Number(p.down);
+        if (startUp != null && startDown != null) break;
+      }
+
       for (const point of points) {
         const el = point?.elapsed ?? 0;
 
         const secElapsed = clamp(Math.round(el), 0, WINDOW_SECS);
         const secRemaining = clamp(WINDOW_SECS - secElapsed, 0, WINDOW_SECS);
 
-        // Apply remaining-time filter here (reversed filter)
         if (secRemaining < normalized.rMin || secRemaining > normalized.rMax) continue;
 
         for (const s of sides) {
@@ -138,22 +175,55 @@ export default function BacktestEngine({ sessions }) {
 
           const win = outcome === s;
 
-          tradesCount++;
-          if (win) winsCount++;
+          // Compute delta vs start-of-slug for this side (if available)
+          const startPrice = (s === "DOWN") ? startDown : startUp;
+          const hasStart = Number.isFinite(startPrice) && startPrice > 0.0001 && startPrice < 0.9999;
 
-          const key = `${s}|${remStart}|${centStart}`;
+          const d = hasStart ? deltaProfitIfWin(STAKE, startPrice, price) : 0;
+
+          let deltaBucketStart = 0;
+          let deltaBucketEnd = 0;
+          let deltaBucketLabel = "n/a";
+          if (normalized.useDelta && hasStart) {
+            const bs = Math.floor(d / normalized.ds) * normalized.ds;
+            deltaBucketStart = bs;
+            deltaBucketEnd = bs + normalized.ds;
+            const a = (bs >= 0) ? `+$${bs}` : `-$${Math.abs(bs)}`;
+            const b = (deltaBucketEnd >= 0) ? `+$${deltaBucketEnd}` : `-$${Math.abs(deltaBucketEnd)}`;
+            deltaBucketLabel = `${a} to ${b}`;
+          }
+
+          const key = normalized.useDelta
+            ? `${s}|${remStart}|${centStart}|${deltaBucketStart}`
+            : `${s}|${remStart}|${centStart}`;
+
           const cur = cells.get(key) ?? {
             side: s,
             remStart, remEnd,
             centStart, centEnd,
+            deltaBucketStart,
+            deltaBucketEnd,
+            deltaBucketLabel,
             wins: 0,
             total: 0,
-            sumPrice01: 0
+            sumPrice01: 0,
+            sumDelta: 0,
+            sumStartPrice: 0,
+            startCount: 0
           };
+
+          tradesCount++;
+          if (win) winsCount++;
 
           cur.total++;
           if (win) cur.wins++;
-          cur.sumPrice01 += price;
+          cur.sumPrice01 += Number(price);
+
+          if (hasStart) {
+            cur.sumDelta += d;
+            cur.sumStartPrice += Number(startPrice);
+            cur.startCount += 1;
+          }
 
           cells.set(key, cur);
         }
@@ -177,7 +247,7 @@ export default function BacktestEngine({ sessions }) {
         const profitIfWinEach = +per.profitIfWinEach.toFixed(2);
         const lossIfLoseEach = +per.lossIfLoseEach.toFixed(2);
 
-        // Scaled by wins
+        // Scaled by wins (requested earlier behavior)
         const profitIfWin = +(profitIfWinEach * x.wins).toFixed(2);
 
         // Bet every occurrence
@@ -187,48 +257,68 @@ export default function BacktestEngine({ sessions }) {
         const likelyOutcome = (winRate01 >= 0.5) ? x.side : opposite(x.side);
 
         const priceLabel = fmtPriceRange(x.centStart, x.centEnd);
-        const timeLabel = (x.remStart === x.remEnd)
-          ? fmtMMSS(x.remStart)
-          : `${fmtMMSS(x.remStart)}-${fmtMMSS(x.remEnd)}`;
+        const timeLabel = (x.remStart === x.remEnd) ? fmtMMSS(x.remStart) : `${fmtMMSS(x.remStart)}-${fmtMMSS(x.remEnd)}`;
+
+        const avgDelta = (x.startCount > 0) ? (x.sumDelta / x.startCount) : 0;
+        const avgDeltaLabel = `$${avgDelta.toFixed(2)}`;
+
+        const avgStartPrice01 = (x.startCount > 0) ? (x.sumStartPrice / x.startCount) : null;
+        const avgStartPriceLabel = (avgStartPrice01 != null) ? fmtPrice01(avgStartPrice01) : "n/a";
 
         let metricVal = winRatePct;
         let metricLabel = "WinRate";
         if (normalized.sortBy === "roi") { metricVal = realizedROI; metricLabel = "Realized ROI%"; }
         if (normalized.sortBy === "pl") { metricVal = realizedPL; metricLabel = "Realized P/L"; }
+        if (normalized.sortBy === "delta") { metricVal = +avgDelta.toFixed(2); metricLabel = "Avg Delta($)"; }
+
+        const rowLabel = normalized.useDelta
+          ? `${x.side} ${priceLabel} @ ${timeLabel} | d=${x.deltaBucketLabel}`
+          : `${x.side} ${priceLabel} @ ${timeLabel}`;
 
         return {
           ...x,
           winRate: winRatePct,
           avgPrice01,
           avgPriceLabel: fmtPrice01(avgPrice01),
+          avgStartPriceLabel,
           likelyOutcome,
           priceLabel,
           timeLabel,
           winTotal: `${x.wins}/${x.total}`,
-          profitIfWinEach,
+
           profitIfWin,
           realizedPL,
           realizedROI,
+
+          avgDelta,
+          avgDeltaLabel,
+
           metricVal,
           metricLabel,
-          rowLabel: `${x.side} ${priceLabel} @ ${timeLabel}`
+          rowLabel
         };
       });
 
     allRows.sort((a, b) => {
       if (normalized.sortBy === "roi") return (b.realizedROI - a.realizedROI) || (b.winRate - a.winRate) || (b.total - a.total);
       if (normalized.sortBy === "pl") return (b.realizedPL - a.realizedPL) || (b.winRate - a.winRate) || (b.total - a.total);
+      if (normalized.sortBy === "delta") return (b.avgDelta - a.avgDelta) || (b.winRate - a.winRate) || (b.total - a.total);
       return (b.winRate - a.winRate) || (b.total - a.total) || (a.remStart - b.remStart) || (a.centStart - b.centStart);
     });
 
-    const rows = allRows.slice(0, normalized.topN);
-    const chartRows = allRows.slice(0, Math.min(30, normalized.topN));
-
     setResults({
       summary: { total: tradesCount, wins: winsCount, winRate: winsCount / tradesCount },
-      rows,
-      chartRows,
-      debug: { trades: tradesCount, cells: cells.size, priceStep: normalized.ps, timeStep: normalized.ts, sortBy: normalized.sortBy }
+      rows: allRows.slice(0, normalized.topN),
+      chartRows: allRows.slice(0, Math.min(30, normalized.topN)),
+      debug: {
+        trades: tradesCount,
+        cells: cells.size,
+        priceStep: normalized.ps,
+        timeStep: normalized.ts,
+        sortBy: normalized.sortBy,
+        useDelta: normalized.useDelta,
+        deltaStep: normalized.ds
+      }
     });
   };
 
@@ -265,7 +355,6 @@ export default function BacktestEngine({ sessions }) {
                 onChange={e => setPriceMax(+e.target.value)}
                 className="w-24 bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-1.5 text-sm text-[var(--text1)]" />
             </div>
-            <p className="text-xs text-[var(--text3)] mt-1">Default is 0.10 to 0.90.</p>
           </div>
 
           <div>
@@ -279,7 +368,6 @@ export default function BacktestEngine({ sessions }) {
                 onChange={e => setRemainingMax(+e.target.value)}
                 className="w-24 bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-1.5 text-sm text-[var(--text1)]" />
             </div>
-            <p className="text-xs text-[var(--text3)] mt-1">This filter is applied to remaining time (300 - elapsed).</p>
           </div>
 
           <div>
@@ -302,6 +390,23 @@ export default function BacktestEngine({ sessions }) {
             </select>
           </div>
 
+          <div className="flex items-center gap-2">
+            <input type="checkbox" checked={useDeltaBuckets} onChange={e => setUseDeltaBuckets(e.target.checked)} />
+            <label className="text-xs text-[var(--text2)]">Use PriceToBeat delta buckets</label>
+          </div>
+
+          <div>
+            <label className="text-xs text-[var(--text2)] block mb-1">Group Delta by ($)</label>
+            <select value={deltaStepDollars} onChange={e => setDeltaStepDollars(+e.target.value)}
+              className="w-full bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-2 text-sm text-[var(--text1)]"
+              disabled={!useDeltaBuckets}>
+              <option value={5}>$5</option>
+              <option value={10}>$10</option>
+              <option value={20}>$20</option>
+              <option value={50}>$50</option>
+            </select>
+          </div>
+
           <div>
             <label className="text-xs text-[var(--text2)] block mb-1">Sort best combos by</label>
             <select value={sortBy} onChange={e => setSortBy(e.target.value)}
@@ -309,6 +414,7 @@ export default function BacktestEngine({ sessions }) {
               <option value="winrate">WinRate</option>
               <option value="roi">Realized ROI% (bet every occurrence)</option>
               <option value="pl">Realized P/L (bet every occurrence)</option>
+              <option value="delta">Avg Delta vs start ($)</option>
             </select>
           </div>
 
@@ -344,7 +450,10 @@ export default function BacktestEngine({ sessions }) {
                   <th className="text-left py-1 pr-4">Side</th>
                   <th className="text-right pr-4">Price bucket</th>
                   <th className="text-right pr-4">Avg price</th>
+                  <th className="text-right pr-4">Start price</th>
                   <th className="text-right pr-4">Time remaining</th>
+                  <th className="text-right pr-4">DeltaBucket</th>
+                  <th className="text-right pr-4">AvgDelta</th>
                   <th className="text-right pr-4">WinRate</th>
                   <th className="text-right pr-4">Win/Total</th>
                   <th className="text-right pr-4">ProfitIfWin</th>
@@ -359,7 +468,10 @@ export default function BacktestEngine({ sessions }) {
                     <td className={`py-1 pr-4 font-bold ${r.side === "UP" ? "text-green-600" : "text-red-600"}`}>{r.side}</td>
                     <td className="text-right pr-4">{r.priceLabel}</td>
                     <td className="text-right pr-4">{r.avgPriceLabel}</td>
+                    <td className="text-right pr-4">{r.avgStartPriceLabel}</td>
                     <td className="text-right pr-4">{r.timeLabel}</td>
+                    <td className="text-right pr-4">{r.deltaBucketLabel || "n/a"}</td>
+                    <td className="text-right pr-4">{r.avgDeltaLabel}</td>
                     <td className="text-right pr-4">{r.winRate}%</td>
                     <td className="text-right pr-4">{r.winTotal}</td>
                     <td className="text-right pr-4">${r.profitIfWin.toFixed(2)}</td>
@@ -384,17 +496,18 @@ export default function BacktestEngine({ sessions }) {
                   tickFormatter={(v) => {
                     if (normalized.sortBy === "winrate") return `${v}%`;
                     if (normalized.sortBy === "roi") return `${v}%`;
+                    if (normalized.sortBy === "delta") return `$${v}`;
                     return `$${v}`;
                   }}
                 />
-                <YAxis type="category" dataKey="rowLabel" width={260} stroke="#94a3b8" tick={{ fontSize: 10 }} />
+                <YAxis type="category" dataKey="rowLabel" width={300} stroke="#94a3b8" tick={{ fontSize: 10 }} />
                 <Tooltip
                   formatter={(v, n, ctx) => {
                     const p = ctx?.payload;
                     if (!p) return [v, n];
                     return [
-                      `${p.metricLabel}=${p.metricVal}, winRate=${p.winRate}%, win/total=${p.winTotal}, profitIfWin=$${p.profitIfWin}, realizedPL=$${p.realizedPL}`,
-                      "Combo"
+                      `${p.metricLabel}=${p.metricVal}, avgDelta=$${p.avgDelta.toFixed(2)}, winRate=${p.winRate}%, win/total=${p.winTotal}, realizedPL=$${p.realizedPL}`,
+                      "Cell"
                     ];
                   }}
                   contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 8 }}
@@ -409,7 +522,7 @@ export default function BacktestEngine({ sessions }) {
           </div>
 
           <div className="text-xs text-[var(--text3)]">
-            Debug: trades={results.debug?.trades ?? 0}, cells={results.debug?.cells ?? 0}, priceStep={results.debug?.priceStep ?? "?"}c, timeStep={results.debug?.timeStep ?? "?"}s, sortBy={results.debug?.sortBy ?? "?"}
+            Debug: trades={results.debug?.trades ?? 0}, cells={results.debug?.cells ?? 0}, useDelta={String(results.debug?.useDelta ?? false)}, deltaStep=${results.debug?.deltaStep ?? "?"}
           </div>
         </div>
       )}
