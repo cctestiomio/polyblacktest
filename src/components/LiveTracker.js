@@ -1,16 +1,16 @@
-"use client";
+﻿"use client";
 import { useEffect, useRef, useState, useCallback } from "react";
 import { LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid, ResponsiveContainer, ReferenceLine } from "recharts";
 import {
   getCurrentSlugTimestamp, getResolutionTs, getMarketSlug,
   fetchMarketBySlug, getSecondsElapsed, getSecondsRemaining,
-  resolveTokenIds, pollGammaOutcome,
+  resolveTokenIds
 } from "../lib/polymarket";
 
 const WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 
 function pad(n) { return String(n).padStart(2, "0"); }
-function fmtS(s) { return `${pad(Math.floor(s / 60))}:${pad(s % 60)}`; }
+function fmtS(s) { return ${pad(Math.floor(s / 60))}:; }
 
 export default function LiveTracker({ onSaveSession }) {
   const [status,       setStatus]       = useState("idle");
@@ -28,34 +28,34 @@ export default function LiveTracker({ onSaveSession }) {
   const [errorMsg,     setErrorMsg]     = useState("");
   const [nextIn,       setNextIn]       = useState(null);
   const [manualSlug,   setManualSlug]   = useState("");
-  const [wsState,      setWsState]      = useState("disconnected"); // connected|disconnected|error
+  const [wsState,      setWsState]      = useState("disconnected"); 
 
   const wsRef        = useRef(null);
-  const tickRef      = useRef(null);   // clock interval
-  const cdRef        = useRef(null);   // countdown after resolution
+  const tickRef      = useRef(null);   
+  const cdRef        = useRef(null);   
   const marketRef    = useRef(null);
   const tokenRef     = useRef({ upId: null, downId: null });
-  const pricesRef    = useRef({ up: null, down: null }); // latest WS prices
+  const pricesRef    = useRef({ up: null, down: null }); 
   const historyRef   = useRef([]);
   const slugTsRef    = useRef(null);
   const savedRef     = useRef(false);
   const startFnRef   = useRef(null);
 
-  // ── stop everything ────────────────────────────────────────────────────────
+  // â”€â”€ stop everything â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const stopAll = useCallback(() => {
     clearInterval(tickRef.current);
     clearInterval(cdRef.current);
     tickRef.current = null;
     cdRef.current   = null;
     if (wsRef.current) {
-      wsRef.current.onclose = null; // prevent reconnect on intentional close
+      wsRef.current.onclose = null; 
       wsRef.current.close();
       wsRef.current = null;
     }
     setWsState("disconnected");
   }, []);
 
-  // ── save session ───────────────────────────────────────────────────────────
+  // â”€â”€ save session â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const doSave = useCallback((history, det) => {
     if (savedRef.current || !history.length || !marketRef.current) return;
     savedRef.current = true;
@@ -70,7 +70,7 @@ export default function LiveTracker({ onSaveSession }) {
     });
   }, [onSaveSession]);
 
-  // ── open WebSocket to Polymarket ───────────────────────────────────────────
+  // â”€â”€ open WebSocket to Polymarket â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const openWs = useCallback((upId, downId) => {
     if (wsRef.current) { wsRef.current.onclose = null; wsRef.current.close(); }
 
@@ -79,7 +79,6 @@ export default function LiveTracker({ onSaveSession }) {
 
     ws.onopen = () => {
       setWsState("connected");
-      // Subscribe to both token IDs
       const ids = [upId, downId].filter(Boolean);
       ws.send(JSON.stringify({ assets_ids: ids, type: "Market" }));
     };
@@ -90,16 +89,14 @@ export default function LiveTracker({ onSaveSession }) {
         const arr  = Array.isArray(msgs) ? msgs : [msgs];
         for (const msg of arr) {
           const assetId = msg.asset_id ?? msg.assetId ?? msg.token_id;
-          // price comes as "price", "best_bid"/"best_ask", or in "outcome_price" fields
-          const rawPrice =
-            msg.price       ??
-            msg.outcome_price ??
-            msg.mid         ??
-            null;
+          const rawPrice = msg.price ?? msg.outcome_price ?? msg.mid ?? null;
 
           if (rawPrice == null || !assetId) continue;
           const p = parseFloat(rawPrice);
-          if (!isFinite(p) || p <= 0.0005 || p >= 0.9999) continue;
+          if (!isFinite(p)) continue; 
+
+          // Filter out crazy noise, but allow reasonable movement
+          if (p <= 0.0001 || p >= 0.9999) continue;
 
           const { upId: uid, downId: did } = tokenRef.current;
           if (assetId === uid) {
@@ -113,21 +110,19 @@ export default function LiveTracker({ onSaveSession }) {
           setCurUp(pricesRef.current.up);
           setCurDown(pricesRef.current.down);
         }
-      } catch { /* ignore bad frames */ }
+      } catch { /* ignore */ }
     };
 
     ws.onerror = () => setWsState("error");
-
     ws.onclose = () => {
       setWsState("disconnected");
-      // Auto-reconnect if still tracking
-      if (slugTsRef.current && tokenRef.current.upId) {
+      if (slugTsRef.current && tokenRef.current.upId && !savedRef.current) {
         setTimeout(() => openWs(tokenRef.current.upId, tokenRef.current.downId), 2000);
       }
     };
   }, []);
 
-  // ── 1-second clock tick — records price from WS cache ─────────────────────
+  // â”€â”€ 1-second clock tick â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const clockTick = useCallback(() => {
     const slugTs = slugTsRef.current;
     if (slugTs == null) return;
@@ -138,49 +133,63 @@ export default function LiveTracker({ onSaveSession }) {
     setRemaining(rem);
 
     const { up, down } = pricesRef.current;
-    const point = { t: Math.floor(Date.now() / 1000), elapsed: el, up, down };
+    // Only record if we have data or preserve previous
+    const lastP = historyRef.current[historyRef.current.length - 1];
+    const point = { 
+      t: Math.floor(Date.now() / 1000), 
+      elapsed: el, 
+      up: up ?? lastP?.up, 
+      down: down ?? lastP?.down 
+    };
+    
     const next  = [...historyRef.current, point];
     historyRef.current = next;
     setPriceHistory(next);
 
+    // â”€â”€ MARKET FINISHED â”€â”€
     if (rem <= 0) {
-      setStatus("resolved");
-      setResolving(true);
       clearInterval(tickRef.current);
       tickRef.current = null;
-      // Close WS — market is over
+      
+      // Close WS immediately
       if (wsRef.current) { wsRef.current.onclose = null; wsRef.current.close(); wsRef.current = null; }
       setWsState("disconnected");
 
-      const snapshot      = [...historyRef.current];
-      const capturedSlug  = marketRef.current?.slug;
-      const capturedSlugTs = slugTs;
+      // 1. Determine Winner Locally by Final Price
+      // If UP > DOWN (or UP > 0.5), UP wins.
+      const finalUp = point.up || 0;
+      const finalDown = point.down || 0;
+      
+      let localOutcome = "UNKNOWN";
+      if (finalUp > finalDown) localOutcome = "UP";
+      else if (finalDown > finalUp) localOutcome = "DOWN";
+      else localOutcome = "UP"; // Tie-breaker fallback (rare)
 
-      // Poll Gamma API for authoritative winner
-      pollGammaOutcome(capturedSlug, 20, 3000).then(polledOutcome => {
-        setResolving(false);
-        setOutcome(polledOutcome);
-        setOutcomeConf(!!polledOutcome);
-        doSave(snapshot, polledOutcome);
+      setStatus("resolved");
+      setOutcome(localOutcome);
+      setOutcomeConf(true); // We trust our local data
+      setResolving(false);
 
-        const nextSlugTs = capturedSlugTs + 300;
-        cdRef.current = setInterval(() => {
-          const nowSec    = Math.floor(Date.now() / 1000);
-          const secUntil  = nextSlugTs - nowSec;
-          if (secUntil <= 0) {
-            clearInterval(cdRef.current);
-            cdRef.current = null;
-            setNextIn(null);
-            if (startFnRef.current) startFnRef.current(undefined, nextSlugTs);
-          } else {
-            setNextIn(secUntil);
-          }
-        }, 500);
-      });
+      // 2. Save Session
+      doSave(next, localOutcome);
+
+      // 3. Auto-Advance to Next Slug (next 5m bucket)
+      const nextSlugTs = slugTs + 300;
+      setNextIn(5); // Show 5s countdown
+
+      let count = 5;
+      cdRef.current = setInterval(() => {
+        count--;
+        setNextIn(count);
+        if (count <= 0) {
+          clearInterval(cdRef.current);
+          if (startFnRef.current) startFnRef.current(undefined, nextSlugTs);
+        }
+      }, 1000);
     }
   }, [doSave, openWs]);
 
-  // ── main entry: load market + connect WS + start clock ────────────────────
+  // â”€â”€ main entry â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const startTracking = useCallback(async (slugOverride, slugTsOverride) => {
     stopAll();
     setStatus("loading");
@@ -201,18 +210,27 @@ export default function LiveTracker({ onSaveSession }) {
     const slug = slugOverride ?? getMarketSlug(slugTs);
 
     setSlugLabel(slug);
-    setManualSlug(slug);   // ← keep input in sync with active slug
-    setQuestion("Loading...");
+    setManualSlug(slug);
+    setQuestion("Loading Market...");
 
     const m = await fetchMarketBySlug(slug);
+    
+    // Handle market missing (likely next one hasn't been created by API yet)
     if (!m || m.error) {
-      setErrorMsg(`Market not found: ${slug}`);
-      setStatus("error");
-      setQuestion("");
-      return;
+       // If we are trying to load the FUTURE market and it fails, 
+       // retry automatically in 2 seconds
+       if (slugTs > (Date.now()/1000)) {
+          setErrorMsg(Waiting for market creation: );
+          setTimeout(() => startTracking(slugOverride, slugTsOverride), 2000);
+          return;
+       }
+       setErrorMsg(Market not found: );
+       setStatus("error");
+       setQuestion("");
+       return;
     }
 
-    // If market already resolved, grab winner immediately
+    // If market already resolved (loading old one)
     if (m.closed && m.winner) {
       const w = m.winner.toLowerCase();
       const det = w === "up" ? "UP" : w === "down" ? "DOWN" : null;
@@ -233,16 +251,14 @@ export default function LiveTracker({ onSaveSession }) {
     setTokenInfo(ids);
     setStatus("tracking");
 
-    // Connect WebSocket
     openWs(ids.upId, ids.downId);
 
-    // Start 1s clock
     tickRef.current = setInterval(clockTick, 1000);
-    clockTick(); // immediate first tick
+    clockTick(); 
   }, [stopAll, openWs, clockTick]);
 
   useEffect(() => { startFnRef.current = startTracking; }, [startTracking]);
-  useEffect(() => { startTracking(); return stopAll; }, []); // eslint-disable-line
+  useEffect(() => { startTracking(); return stopAll; }, []); 
 
   const chartData = priceHistory
     .filter(p => p.up != null || p.down != null)
@@ -270,20 +286,19 @@ export default function LiveTracker({ onSaveSession }) {
 
   return (
     <div className="space-y-4">
-
       {/* Header */}
       <div className="flex flex-wrap items-start gap-3">
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
             <p className="text-xs font-mono text-slate-400 dark:text-slate-500 truncate">{slugLabel || "Searching..."}</p>
-            <span className={`text-xs font-semibold ${wsColor}`}>
-              {wsState === "connected" ? "● WS" : wsState === "error" ? "● WS ERR" : "○ WS"}
+            <span className={	ext-xs font-semibold }>
+              {wsState === "connected" ? "â— WS" : wsState === "error" ? "â— WS ERR" : "â—‹ WS"}
             </span>
           </div>
           <p className="text-sm text-slate-700 dark:text-slate-300 truncate">{question}</p>
         </div>
         <div className="flex gap-2 items-center shrink-0">
-          <span className={`px-2 py-0.5 rounded text-xs font-bold ${statusColor}`}>{status.toUpperCase()}</span>
+          <span className={px-2 py-0.5 rounded text-xs font-bold }>{status.toUpperCase()}</span>
           <button onClick={() => startTracking()}
             className="px-3 py-1 bg-indigo-600 hover:bg-indigo-500 text-white rounded text-xs font-semibold">
             Refresh
@@ -291,7 +306,7 @@ export default function LiveTracker({ onSaveSession }) {
         </div>
       </div>
 
-      {/* Slug input — pre-filled with current slug */}
+      {/* Slug input */}
       <div className="flex gap-2">
         <input
           value={manualSlug}
@@ -303,7 +318,7 @@ export default function LiveTracker({ onSaveSession }) {
           onClick={() => {
             const s = manualSlug.trim();
             if (!s) return;
-            const ts = parseInt(s.replace(/^.*-(\d+)$/, "$1"), 10);
+            const ts = parseInt(s.replace(/^.*-(\d+)$/, ""), 10);
             startTracking(s, isNaN(ts) ? undefined : ts);
           }}
           className="px-4 py-1.5 bg-slate-100 hover:bg-slate-200 dark:bg-slate-700 dark:hover:bg-slate-600 rounded text-sm font-semibold text-slate-700 dark:text-slate-200">
@@ -313,56 +328,30 @@ export default function LiveTracker({ onSaveSession }) {
 
       {errorMsg && <p className="text-red-500 dark:text-red-400 text-sm">{errorMsg}</p>}
 
-      {/* Token debug strip */}
-      {tokenInfo && (
-        <div className="bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg px-3 py-2 font-mono text-xs space-y-0.5">
-          <div><span className="text-slate-400">UP&nbsp;&nbsp; </span><span className="text-green-600 dark:text-green-400">{tokenInfo.upId ?? "NOT FOUND"}</span></div>
-          <div><span className="text-slate-400">DOWN </span><span className="text-red-600 dark:text-red-400">{tokenInfo.downId ?? "NOT FOUND"}</span></div>
-          <div><span className="text-slate-400">Priced: </span><span className="text-blue-600 dark:text-blue-400">{pricedPts} / {priceHistory.length} pts</span></div>
-        </div>
-      )}
-
       {/* Stats */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-        <StatCard label="UP Price"   value={curUp   != null ? `${(curUp*100).toFixed(1)}c`   : "---"} color="text-green-600 dark:text-green-400" />
-        <StatCard label="DOWN Price" value={curDown != null ? `${(curDown*100).toFixed(1)}c` : "---"} color="text-red-600 dark:text-red-400" />
+        <StatCard label="UP Price"   value={curUp   != null ? ${(curUp*100).toFixed(1)}c   : "---"} color="text-green-600 dark:text-green-400" />
+        <StatCard label="DOWN Price" value={curDown != null ? ${(curDown*100).toFixed(1)}c : "---"} color="text-red-600 dark:text-red-400" />
         <StatCard label="Elapsed"    value={fmtS(elapsed)}   color="text-blue-600 dark:text-blue-400" />
         <StatCard label="Remaining"  value={fmtS(remaining)} color="text-orange-500 dark:text-orange-400" />
       </div>
 
       {/* Resolved banner */}
       {status === "resolved" && (
-        <div className={`rounded-xl p-4 text-center border ${
-          resolving
-            ? "bg-slate-50 dark:bg-slate-800 border-slate-200 dark:border-slate-700"
-            : outcome === "UP"
-            ? "bg-green-50 dark:bg-green-900/30 border-green-200 dark:border-green-800"
-            : outcome === "DOWN"
-            ? "bg-red-50 dark:bg-red-900/30 border-red-200 dark:border-red-800"
-            : "bg-slate-50 dark:bg-slate-800 border-slate-200"
-        }`}>
-          {resolving ? (
+        <div className={ounded-xl p-4 text-center border }>
             <div>
-              <p className="text-slate-500 dark:text-slate-400 font-semibold animate-pulse">Fetching resolution from Polymarket...</p>
-              <p className="text-xs text-slate-400 mt-1">Checking Gamma API every 3s (up to 60s)</p>
-            </div>
-          ) : (
-            <div>
-              <p className={`font-bold text-xl ${outcome === "UP" ? "text-green-700 dark:text-green-300" : outcome === "DOWN" ? "text-red-700 dark:text-red-300" : "text-slate-600"}`}>
-                {outcome === "UP"   && "▲ RESOLVED UP"}
-                {outcome === "DOWN" && "▼ RESOLVED DOWN"}
-                {!outcome           && "⏳ RESOLVED — awaiting confirmation"}
+              <p className={ont-bold text-xl }>
+                {outcome === "UP"   && "â–² RESOLVED UP"}
+                {outcome === "DOWN" && "â–¼ RESOLVED DOWN"}
+                {!outcome           && "UNKNOWN RESULT"}
               </p>
-              {!outcomeConf && outcome && (
-                <p className="text-xs text-amber-600 dark:text-amber-400 mt-1">
-                  Gamma API did not confirm within 60s — use UP/DOWN buttons below to correct if wrong.
+              
+              {nextIn != null && (
+                <p className="text-sm font-bold animate-pulse text-indigo-600 dark:text-indigo-400 mt-2">
+                  Next market loading in {nextIn}s...
                 </p>
               )}
-              {nextIn != null && (
-                <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">Next market in {fmtS(nextIn)}</p>
-              )}
             </div>
-          )}
         </div>
       )}
 
@@ -372,7 +361,7 @@ export default function LiveTracker({ onSaveSession }) {
           <div className="h-full flex flex-col items-center justify-center gap-2 text-slate-400 text-sm">
             {status === "tracking" ? (
               <>
-                <p>Waiting for prices via WebSocket... ({priceHistory.length} pts)</p>
+                <p>Waiting for prices... ({priceHistory.length} pts)</p>
                 <p className="text-xs">WS status: <span className={wsColor}>{wsState}</span></p>
               </>
             ) : <p>No price data</p>}
@@ -381,11 +370,11 @@ export default function LiveTracker({ onSaveSession }) {
           <ResponsiveContainer width="100%" height="100%">
             <LineChart data={chartData}>
               <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
-              <XAxis dataKey="elapsed" tickFormatter={v => `${v}s`} stroke="#94a3b8" tick={{ fontSize: 11 }} interval="preserveStartEnd" />
-              <YAxis domain={[0, 100]} tickFormatter={v => `${v}c`} stroke="#94a3b8" tick={{ fontSize: 11 }} />
+              <XAxis dataKey="elapsed" tickFormatter={v => ${v}s} stroke="#94a3b8" tick={{ fontSize: 11 }} interval="preserveStartEnd" />
+              <YAxis domain={[0, 100]} tickFormatter={v => ${v}c} stroke="#94a3b8" tick={{ fontSize: 11 }} />
               <Tooltip
-                formatter={(v, n) => [v != null ? `${v}c` : "---", n]}
-                labelFormatter={v => `${v}s elapsed`}
+                formatter={(v, n) => [v != null ? ${v}c : "---", n]}
+                labelFormatter={v => ${v}s elapsed}
                 contentStyle={{ background: "#fff", border: "1px solid #e2e8f0", borderRadius: 8, color: "#0f172a", fontSize: 12 }}
               />
               <ReferenceLine y={50} stroke="#94a3b8" strokeDasharray="4 2" />
@@ -397,7 +386,7 @@ export default function LiveTracker({ onSaveSession }) {
       </div>
 
       <div className="flex items-center justify-between">
-        <p className="text-xs text-slate-400">{priceHistory.length} pts · {pricedPts} priced · WS <span className={wsColor}>{wsState}</span></p>
+        <p className="text-xs text-slate-400">{priceHistory.length} pts Â· {pricedPts} priced Â· WS <span className={wsColor}>{wsState}</span></p>
         <button
           onClick={() => doSave(historyRef.current, outcome)}
           disabled={priceHistory.length === 0}
@@ -413,7 +402,7 @@ function StatCard({ label, value, color }) {
   return (
     <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-3 text-center shadow-sm">
       <p className="text-xs text-slate-400 mb-1">{label}</p>
-      <p className={`text-xl font-bold font-mono ${color}`}>{value}</p>
+      <p className={	ext-xl font-bold font-mono }>{value}</p>
     </div>
   );
 }
