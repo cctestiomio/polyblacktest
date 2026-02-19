@@ -1,7 +1,7 @@
-<# patch-backtestengine.ps1
-   Overwrites src/components/BacktestEngine.js with a clearer version that supports:
-   - TradeMode: FIRST_PER_SESSION vs EVERY_MATCH
-   - Price bin size (cents), elapsed bin size (seconds)
+<# patch-backtestengine-combo.ps1
+   Overwrites src/components/BacktestEngine.js to add:
+   - groupBy: priceRange | elapsedRange | priceTime (heatmap)
+   - 1¢ bins (0.01..0.99) and 1s bins (0..300)
    Creates a timestamped .bak backup first.
 #>
 
@@ -10,164 +10,148 @@ param(
   [switch]$DryRun
 )
 
-$enginePath = Join-Path $RepoRoot "src\components\BacktestEngine.js"
+$target = Join-Path $RepoRoot "src\components\BacktestEngine.js"
 
-if (-not (Test-Path $enginePath)) {
-  Write-Error "Cannot find: $enginePath`nRun from repo root or pass -RepoRoot <path>."
+if (-not (Test-Path $target)) {
+  Write-Error "Cannot find: $target`nRun from repo root or pass -RepoRoot <path>."
   exit 1
 }
 
 $newContent = @'
 "use client";
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid,
-  ResponsiveContainer, Cell,
+  ResponsiveContainer, Cell, LineChart, Line,
 } from "recharts";
 
-const SIDE_LABEL = {
-  UP: "YES (UP)",
-  DOWN: "NO (DOWN)",
-  BOTH: "YES + NO",
-};
+const PRICE_CENTS = Array.from({ length: 99 }, (_, i) => i + 1);  // 1..99
+const TIME_SECS   = Array.from({ length: 301 }, (_, i) => i);     // 0..300
 
-const TRADE_MODE_LABEL = {
-  FIRST_PER_SESSION: "First match per session",
-  EVERY_MATCH: "Every matching point",
-};
+function clamp(n, lo, hi) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return lo;
+  return Math.min(hi, Math.max(lo, x));
+}
 
-function clampNum(v, min, max) {
-  const n = Number(v);
-  if (!Number.isFinite(n)) return min;
-  return Math.min(max, Math.max(min, n));
+function colorForWinRate01(wr) {
+  // wr: 0..1
+  // Neutral around 0.5, more saturated as you move away.
+  const t = Math.min(1, Math.abs(wr - 0.5) * 2); // 0..1
+  const hue = wr >= 0.5 ? 140 : 0;               // green vs red
+  const sat = 70;
+  const light = 92 - (t * 45);                   // 92..47
+  return `hsl(${hue}, ${sat}%, ${light}%)`;
 }
 
 export default function BacktestEngine({ sessions }) {
-  // Strategy inputs
-  const [side, setSide] = useState("UP"); // YES=UP, NO=DOWN
-  const [priceMin, setPriceMin] = useState(0.1);
-  const [priceMax, setPriceMax] = useState(0.9);
+  const [side, setSide] = useState("UP"); // UP, DOWN, BOTH
+  const [priceMin, setPriceMin] = useState(0.10);
+  const [priceMax, setPriceMax] = useState(0.90);
   const [elapsedMin, setElapsedMin] = useState(0);
   const [elapsedMax, setElapsedMax] = useState(300);
-
-  // Output settings
-  const [groupBy, setGroupBy] = useState("priceRange"); // priceRange | elapsedRange
-  const [priceBinCents, setPriceBinCents] = useState(5); // bucket size in cents
-  const [elapsedBinSec, setElapsedBinSec] = useState(30); // bucket size in seconds
-  const [tradeMode, setTradeMode] = useState("FIRST_PER_SESSION"); // FIRST_PER_SESSION | EVERY_MATCH
-
+  const [groupBy, setGroupBy] = useState("priceRange"); // priceRange | elapsedRange | priceTime
   const [results, setResults] = useState(null);
 
-  const normalized = useMemo(() => {
-    const pMin = Math.min(priceMin, priceMax);
-    const pMax = Math.max(priceMin, priceMax);
-    const eMin = Math.min(elapsedMin, elapsedMax);
-    const eMax = Math.max(elapsedMin, elapsedMax);
-
-    return {
-      pMin: clampNum(pMin, 0, 1),
-      pMax: clampNum(pMax, 0, 1),
-      eMin: clampNum(eMin, 0, 300),
-      eMax: clampNum(eMax, 0, 300),
-      priceBinCents: clampNum(priceBinCents, 1, 50),
-      elapsedBinSec: clampNum(elapsedBinSec, 5, 300),
-    };
-  }, [priceMin, priceMax, elapsedMin, elapsedMax, priceBinCents, elapsedBinSec]);
-
   const runBacktest = () => {
+    const pMin = clamp(Math.min(priceMin, priceMax), 0, 1);
+    const pMax = clamp(Math.max(priceMin, priceMax), 0, 1);
+    const eMin = clamp(Math.min(elapsedMin, elapsedMax), 0, 300);
+    const eMax = clamp(Math.max(elapsedMin, elapsedMax), 0, 300);
+
+    const sides = side === "BOTH" ? ["UP", "DOWN"] : [side];
     const trades = [];
-    const selectedSides = side === "BOTH" ? ["UP", "DOWN"] : [side];
 
     for (const session of sessions) {
-      const outcome = session?.outcome;
-      if (!outcome) continue;
+      if (!session?.outcome) continue;
 
-      const points = Array.isArray(session?.priceHistory) ? session.priceHistory : [];
-      if (!points.length) continue;
+      for (const point of session.priceHistory ?? []) {
+        const el = point?.elapsed ?? 0;
+        if (el < eMin || el > eMax) continue;
 
-      // For FIRST_PER_SESSION, we allow at most one trade per (session, side).
-      for (const s of selectedSides) {
-        let tookTradeForThisSide = false;
-
-        for (const point of points) {
-          const el = point?.elapsed ?? 0;
-          if (el < normalized.eMin || el > normalized.eMax) continue;
-
+        for (const s of sides) {
           const price = s === "DOWN" ? point?.down : point?.up;
           if (price == null) continue;
-          if (price < normalized.pMin || price > normalized.pMax) continue;
+          if (price < pMin || price > pMax) continue;
 
-          const win = outcome === s;
-
+          const win = session.outcome === s;
           trades.push({
-            slug: session?.slug ?? "?",
+            slug: session.slug,
             elapsed: el,
-            price, // 0..1
+            price,
             side: s,
-            outcome,
+            outcome: session.outcome,
             win,
           });
-
-          if (tradeMode === "FIRST_PER_SESSION") {
-            tookTradeForThisSide = true;
-            break; // stop after first match in this session for this side
-          }
-        }
-
-        if (tradeMode === "FIRST_PER_SESSION" && tookTradeForThisSide) {
-          // continue; (explicitly does nothing; clarity)
         }
       }
     }
 
     if (!trades.length) {
-      setResults({
-        trades: [],
-        summary: null,
-        chart: [],
-        params: { ...normalized, side, groupBy, priceBinCents: normalized.priceBinCents, elapsedBinSec: normalized.elapsedBinSec, tradeMode },
-      });
+      setResults({ trades: [], summary: null, chartPrice: [], chartTime: [], heat: new Map() });
       return;
     }
 
     const wins = trades.reduce((acc, t) => acc + (t.win ? 1 : 0), 0);
     const winRate = wins / trades.length;
 
-    const bucket = {};
-    if (groupBy === "priceRange") {
-      const bin = normalized.priceBinCents;
-      for (const t of trades) {
-        const cents = Math.floor((t.price * 100) / bin) * bin;
-        const label = `${cents}¢`;
-        bucket[label] = bucket[label] ?? { wins: 0, total: 0, sort: cents };
-        bucket[label].total++;
-        if (t.win) bucket[label].wins++;
+    // --- Build 1¢ price chart (1..99) ---
+    const byCent = new Array(100).fill(null).map(() => ({ wins: 0, total: 0 }));
+    // --- Build 1s time chart (0..300) ---
+    const bySec = new Array(301).fill(null).map(() => ({ wins: 0, total: 0 }));
+    // --- Build heatmap (sec x cent) ---
+    const heat = new Map(); // key = sec*100 + cent
+
+    for (const t of trades) {
+      const cent = clamp(Math.round(t.price * 100), 0, 100);
+      const sec = clamp(Math.round(t.elapsed), 0, 300);
+
+      if (cent >= 1 && cent <= 99) {
+        byCent[cent].total++;
+        if (t.win) byCent[cent].wins++;
       }
-    } else {
-      const bin = normalized.elapsedBinSec;
-      for (const t of trades) {
-        const sec = Math.floor(t.elapsed / bin) * bin;
-        const label = `${sec}s`;
-        bucket[label] = bucket[label] ?? { wins: 0, total: 0, sort: sec };
-        bucket[label].total++;
-        if (t.win) bucket[label].wins++;
+
+      bySec[sec].total++;
+      if (t.win) bySec[sec].wins++;
+
+      if (cent >= 1 && cent <= 99) {
+        const key = (sec * 100) + cent;
+        const cur = heat.get(key) ?? { wins: 0, total: 0 };
+        cur.total++;
+        if (t.win) cur.wins++;
+        heat.set(key, cur);
       }
     }
 
-    const chart = Object.entries(bucket)
-      .sort((a, b) => a[1].sort - b[1].sort)
-      .map(([label, { wins, total }]) => ({
-        label,
-        winRate: +((wins / total) * 100).toFixed(1),
+    const chartPrice = PRICE_CENTS.map((c) => {
+      const { wins, total } = byCent[c];
+      return {
+        cent: c,
+        label: `${c}¢`,
+        winRate: total ? +((wins / total) * 100).toFixed(1) : null,
         wins,
         total,
-      }));
+      };
+    });
+
+    const chartTime = TIME_SECS.map((s) => {
+      const { wins, total } = bySec[s];
+      return {
+        sec: s,
+        label: `${s}s`,
+        winRate: total ? +((wins / total) * 100).toFixed(1) : null,
+        wins,
+        total,
+      };
+    });
 
     setResults({
       trades,
       summary: { total: trades.length, wins, winRate },
-      chart,
-      params: { ...normalized, side, groupBy, priceBinCents: normalized.priceBinCents, elapsedBinSec: normalized.elapsedBinSec, tradeMode },
+      chartPrice,
+      chartTime,
+      heat,
+      params: { pMin, pMax, eMin, eMax, side },
     });
   };
 
@@ -176,93 +160,41 @@ export default function BacktestEngine({ sessions }) {
       <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-5 shadow-sm space-y-4">
         <h2 className="text-lg font-bold">Backtest Configuration</h2>
 
-        <p className="text-xs text-[var(--text3)]">
-          A “trade” is recorded when a session has a price point within your filters.
-          Choose whether to count the first match per session (typical) or every matching point (more aggressive).
-        </p>
-
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div>
-            <label className="text-xs text-[var(--text2)] block mb-1">Buy Token</label>
+            <label className="text-xs text-[var(--text2)] block mb-1">Buy Side</label>
             <div className="flex gap-2">
               {["UP", "DOWN", "BOTH"].map(s => (
                 <button
                   key={s}
                   onClick={() => setSide(s)}
-                  className={`flex-1 py-2 rounded-lg font-bold text-sm transition ${side === s
-                    ? "bg-indigo-600 text-white"
-                    : "bg-[var(--bg2)] hover:bg-[var(--bg3)] text-[var(--text1)] border border-[var(--border)]"
+                  className={`flex-1 py-2 rounded-lg font-bold text-sm transition ${
+                    side === s
+                      ? "bg-indigo-600 text-white"
+                      : "bg-[var(--bg2)] hover:bg-[var(--bg3)] text-[var(--text1)] border border-[var(--border)]"
                   }`}
                 >
-                  {SIDE_LABEL[s]}
+                  {s}
                 </button>
               ))}
             </div>
           </div>
 
           <div>
-            <label className="text-xs text-[var(--text2)] block mb-1">Trade Counting</label>
+            <label className="text-xs text-[var(--text2)] block mb-1">Chart View</label>
             <div className="flex gap-2">
-              {["FIRST_PER_SESSION", "EVERY_MATCH"].map(m => (
-                <button
-                  key={m}
-                  onClick={() => setTradeMode(m)}
-                  className={`flex-1 py-2 rounded-lg text-sm transition ${tradeMode === m
-                    ? "bg-indigo-600 text-white"
-                    : "bg-[var(--bg2)] hover:bg-[var(--bg3)] text-[var(--text1)] border border-[var(--border)]"
-                  }`}
-                >
-                  {TRADE_MODE_LABEL[m]}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div>
-            <label className="text-xs text-[var(--text2)] block mb-1">Entry Price Range (0–1)</label>
-            <div className="flex gap-2 items-center">
-              <input
-                type="number" min="0" max="1" step="0.01" value={priceMin}
-                onChange={e => setPriceMin(+e.target.value)}
-                className="w-24 bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-1.5 text-sm text-[var(--text1)]"
-              />
-              <span className="text-[var(--text3)]">to</span>
-              <input
-                type="number" min="0" max="1" step="0.01" value={priceMax}
-                onChange={e => setPriceMax(+e.target.value)}
-                className="w-24 bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-1.5 text-sm text-[var(--text1)]"
-              />
-            </div>
-            <p className="text-xs text-[var(--text3)] mt-1">Example: 0.55–0.65 ≈ 55¢–65¢</p>
-          </div>
-
-          <div>
-            <label className="text-xs text-[var(--text2)] block mb-1">Time Elapsed Range (seconds 0–300)</label>
-            <div className="flex gap-2 items-center">
-              <input
-                type="number" min="0" max="300" step="1" value={elapsedMin}
-                onChange={e => setElapsedMin(+e.target.value)}
-                className="w-24 bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-1.5 text-sm text-[var(--text1)]"
-              />
-              <span className="text-[var(--text3)]">to</span>
-              <input
-                type="number" min="0" max="300" step="1" value={elapsedMax}
-                onChange={e => setElapsedMax(+e.target.value)}
-                className="w-24 bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-1.5 text-sm text-[var(--text1)]"
-              />
-            </div>
-          </div>
-
-          <div>
-            <label className="text-xs text-[var(--text2)] block mb-1">Group Results By</label>
-            <div className="flex gap-2">
-              {[["priceRange", "Entry Price"], ["elapsedRange", "Elapsed Time"]].map(([v, l]) => (
+              {[
+                ["priceRange", "Entry Price (1¢)"],
+                ["elapsedRange", "Elapsed Time (1s)"],
+                ["priceTime", "Price × Time (Heatmap)"],
+              ].map(([v, l]) => (
                 <button
                   key={v}
                   onClick={() => setGroupBy(v)}
-                  className={`flex-1 py-2 rounded-lg text-sm transition ${groupBy === v
-                    ? "bg-indigo-600 text-white"
-                    : "bg-[var(--bg2)] hover:bg-[var(--bg3)] text-[var(--text1)] border border-[var(--border)]"
+                  className={`flex-1 py-2 rounded-lg text-sm transition ${
+                    groupBy === v
+                      ? "bg-indigo-600 text-white"
+                      : "bg-[var(--bg2)] hover:bg-[var(--bg3)] text-[var(--text1)] border border-[var(--border)]"
                   }`}
                 >
                   {l}
@@ -271,35 +203,36 @@ export default function BacktestEngine({ sessions }) {
             </div>
           </div>
 
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="text-xs text-[var(--text2)] block mb-1">Price Bin (¢)</label>
-              <select
-                value={priceBinCents}
-                onChange={e => setPriceBinCents(+e.target.value)}
-                className="w-full bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-2 text-sm text-[var(--text1)]"
-              >
-                {[1, 5, 10, 20].map(v => <option key={v} value={v}>{v}¢ bins</option>)}
-              </select>
+          <div>
+            <label className="text-xs text-[var(--text2)] block mb-1">Entry Price Range (0–1)</label>
+            <div className="flex gap-2 items-center">
+              <input type="number" min="0" max="1" step="0.01" value={priceMin}
+                onChange={e => setPriceMin(+e.target.value)}
+                className="w-24 bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-1.5 text-sm text-[var(--text1)]" />
+              <span className="text-[var(--text3)]">to</span>
+              <input type="number" min="0" max="1" step="0.01" value={priceMax}
+                onChange={e => setPriceMax(+e.target.value)}
+                className="w-24 bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-1.5 text-sm text-[var(--text1)]" />
             </div>
-            <div>
-              <label className="text-xs text-[var(--text2)] block mb-1">Time Bin (s)</label>
-              <select
-                value={elapsedBinSec}
-                onChange={e => setElapsedBinSec(+e.target.value)}
-                className="w-full bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-2 text-sm text-[var(--text1)]"
-              >
-                {[10, 15, 30, 60].map(v => <option key={v} value={v}>{v}s bins</option>)}
-              </select>
+            <p className="text-xs text-[var(--text3)] mt-1">Tip: set 0.01–0.99 to show full domain</p>
+          </div>
+
+          <div>
+            <label className="text-xs text-[var(--text2)] block mb-1">Time Elapsed Range (seconds 0–300)</label>
+            <div className="flex gap-2 items-center">
+              <input type="number" min="0" max="300" step="1" value={elapsedMin}
+                onChange={e => setElapsedMin(+e.target.value)}
+                className="w-24 bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-1.5 text-sm text-[var(--text1)]" />
+              <span className="text-[var(--text3)]">to</span>
+              <input type="number" min="0" max="300" step="1" value={elapsedMax}
+                onChange={e => setElapsedMax(+e.target.value)}
+                className="w-24 bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-1.5 text-sm text-[var(--text1)]" />
             </div>
           </div>
         </div>
 
-        <button
-          onClick={runBacktest}
-          disabled={sessions.length === 0}
-          className="w-full py-3 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-xl font-bold text-base"
-        >
+        <button onClick={runBacktest} disabled={sessions.length === 0}
+          className="w-full py-3 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-xl font-bold text-base">
           ▶ Run Backtest ({sessions.length} session{sessions.length !== 1 ? "s" : ""} loaded)
         </button>
       </div>
@@ -318,32 +251,37 @@ export default function BacktestEngine({ sessions }) {
                 />
               </div>
 
-              <div className="text-xs text-[var(--text3)]">
-                Filters: {SIDE_LABEL[results.params.side]} · price {results.params.pMin.toFixed(2)}–{results.params.pMax.toFixed(2)} · time {results.params.eMin}–{results.params.eMax}s · mode {TRADE_MODE_LABEL[results.params.tradeMode]}
-              </div>
-
-              {results.chart.length > 0 && (
-                <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-4 shadow-sm" style={{ height: 300 }}>
-                  <p className="text-xs text-[var(--text2)] mb-3">
-                    Win Rate by {groupBy === "priceRange" ? `Entry Price (${results.params.priceBinCents}¢ bins)` : `Elapsed Time (${results.params.elapsedBinSec}s bins)`}
-                  </p>
+              {/* Charts */}
+              {groupBy === "priceRange" && (
+                <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-4 shadow-sm" style={{ height: 340 }}>
+                  <p className="text-xs text-[var(--text2)] mb-3">Win Rate by Entry Price (1¢ increments)</p>
                   <ResponsiveContainer width="100%" height="90%">
-                    <BarChart data={results.chart}>
+                    <BarChart data={results.chartPrice}>
                       <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-                      <XAxis dataKey="label" stroke="#94a3b8" tick={{ fontSize: 11 }} />
+                      <XAxis
+                        dataKey="cent"
+                        stroke="#94a3b8"
+                        tick={{ fontSize: 10 }}
+                        tickFormatter={(v) => `${v}¢`}
+                        interval={0}
+                        angle={-60}
+                        textAnchor="end"
+                        height={80}
+                      />
                       <YAxis domain={[0, 100]} tickFormatter={v => `${v}%`} stroke="#94a3b8" tick={{ fontSize: 11 }} />
                       <Tooltip
                         formatter={(v, n, ctx) => {
-                          if (n === "winRate") return [`${v}%`, "Win Rate"];
-                          if (n === "total") return [v, "Trades"];
-                          if (n === "wins") return [v, "Wins"];
+                          const p = ctx?.payload;
+                          if (!p) return [v, n];
+                          if (n === "winRate") return [p.total ? `${p.winRate}%` : "—", "Win Rate"];
                           return [v, n];
                         }}
+                        labelFormatter={(cent) => `${cent}¢`}
                         contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 8 }}
                       />
-                      <Bar dataKey="winRate" radius={[4, 4, 0, 0]}>
-                        {results.chart.map((e, i) => (
-                          <Cell key={i} fill={e.winRate >= 50 ? "#16a34a" : "#dc2626"} />
+                      <Bar dataKey="winRate" radius={[3, 3, 0, 0]}>
+                        {results.chartPrice.map((e, i) => (
+                          <Cell key={i} fill={e.winRate == null ? "rgba(148,163,184,0.25)" : (e.winRate >= 50 ? "#16a34a" : "#dc2626")} />
                         ))}
                       </Bar>
                     </BarChart>
@@ -351,6 +289,86 @@ export default function BacktestEngine({ sessions }) {
                 </div>
               )}
 
+              {groupBy === "elapsedRange" && (
+                <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-4 shadow-sm" style={{ height: 340 }}>
+                  <p className="text-xs text-[var(--text2)] mb-3">Win Rate by Elapsed Time (1s increments)</p>
+                  <ResponsiveContainer width="100%" height="90%">
+                    <LineChart data={results.chartTime}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+                      <XAxis
+                        dataKey="sec"
+                        stroke="#94a3b8"
+                        tick={{ fontSize: 11 }}
+                        tickFormatter={(v) => `${v}s`}
+                        interval={29} /* keep chart readable; data is still 1s resolution */
+                      />
+                      <YAxis domain={[0, 100]} tickFormatter={v => `${v}%`} stroke="#94a3b8" tick={{ fontSize: 11 }} />
+                      <Tooltip
+                        formatter={(v, n, ctx) => {
+                          const p = ctx?.payload;
+                          if (!p) return [v, n];
+                          return [p.total ? `${p.winRate}% (n=${p.total})` : "—", "Win Rate"];
+                        }}
+                        labelFormatter={(sec) => `${sec}s`}
+                        contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 8 }}
+                      />
+                      <Line type="monotone" dataKey="winRate" stroke="#6366f1" dot={false} connectNulls={false} strokeWidth={2} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              )}
+
+              {groupBy === "priceTime" && (
+                <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-4 shadow-sm">
+                  <p className="text-xs text-[var(--text2)] mb-3">Win Rate Heatmap (Price × Time)</p>
+
+                  <div className="text-xs text-[var(--text3)] mb-3">
+                    X-axis: elapsed seconds (0–300). Y-axis: entry price cents (1–99). Hover cells for details.
+                  </div>
+
+                  <div className="w-full border border-[var(--border)] rounded-lg overflow-hidden" style={{ height: 420 }}>
+                    <svg
+                      viewBox="0 0 301 99"
+                      preserveAspectRatio="none"
+                      width="100%"
+                      height="100%"
+                    >
+                      {/* background */}
+                      <rect x="0" y="0" width="301" height="99" fill="rgba(148,163,184,0.08)" />
+
+                      {Array.from(results.heat.entries()).map(([key, v]) => {
+                        const sec = Math.floor(key / 100);
+                        const cent = key % 100;
+                        if (cent < 1 || cent > 99) return null;
+
+                        const wr01 = v.total ? (v.wins / v.total) : 0.5;
+                        const fill = colorForWinRate01(wr01);
+
+                        // y=0 at top, we want 99¢ near top, 1¢ near bottom
+                        const y = (99 - cent);
+
+                        return (
+                          <g key={key}>
+                            <rect x={sec} y={y} width="1" height="1" fill={fill} opacity="0.95">
+                              <title>{`t=${sec}s, price=${cent}¢, winRate=${(wr01*100).toFixed(1)}% (wins=${v.wins}, n=${v.total})`}</title>
+                            </rect>
+                          </g>
+                        );
+                      })}
+                    </svg>
+                  </div>
+
+                  <div className="mt-3 text-xs text-[var(--text3)] flex items-center gap-3">
+                    <span>0%</span>
+                    <div className="flex-1 h-2 rounded"
+                      style={{ background: "linear-gradient(90deg, #dc2626, #eab308, #16a34a)" }}
+                    />
+                    <span>100%</span>
+                  </div>
+                </div>
+              )}
+
+              {/* Trade log */}
               <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-4 shadow-sm">
                 <p className="text-xs text-[var(--text2)] mb-3">Trade Log (last 50)</p>
                 <div className="overflow-x-auto">
@@ -359,8 +377,8 @@ export default function BacktestEngine({ sessions }) {
                       <tr className="text-[var(--text3)] border-b border-[var(--border)]">
                         <th className="text-left py-1 pr-4">Slug</th>
                         <th className="text-right pr-4">Elapsed</th>
-                        <th className="text-right pr-4">Entry</th>
-                        <th className="text-right pr-4">Token</th>
+                        <th className="text-right pr-4">Price</th>
+                        <th className="text-right pr-4">Side</th>
                         <th className="text-right pr-4">Outcome</th>
                         <th className="text-right">Result</th>
                       </tr>
@@ -369,8 +387,8 @@ export default function BacktestEngine({ sessions }) {
                       {results.trades.slice(-50).reverse().map((t, i) => (
                         <tr key={i} className="border-b border-[var(--border)] hover:bg-[var(--bg2)]">
                           <td className="py-1 pr-4 truncate max-w-xs font-mono text-[var(--text3)]">{t.slug}</td>
-                          <td className="text-right pr-4">{t.elapsed}s</td>
-                          <td className="text-right pr-4">{(t.price * 100).toFixed(1)}¢</td>
+                          <td className="text-right pr-4">{Math.round(t.elapsed)}s</td>
+                          <td className="text-right pr-4">{(t.price * 100).toFixed(2)}¢</td>
                           <td className={`text-right pr-4 font-bold ${t.side === "UP" ? "text-green-600" : "text-red-600"}`}>{t.side}</td>
                           <td className={`text-right pr-4 font-bold ${t.outcome === "UP" ? "text-green-600" : "text-red-600"}`}>{t.outcome}</td>
                           <td className={`text-right font-bold ${t.win ? "text-green-600" : "text-red-600"}`}>{t.win ? "✓" : "✗"}</td>
@@ -403,13 +421,13 @@ function SCard({ label, value, color }) {
 '@
 
 if ($DryRun) {
-  Write-Host "DRY RUN: Would overwrite $enginePath"
+  Write-Host "DRY RUN: Would overwrite $target"
   exit 0
 }
 
-$backup = "$enginePath.bak.$(Get-Date -Format yyyyMMdd-HHmmss)"
-Copy-Item -Path $enginePath -Destination $backup -Force
-Set-Content -Path $enginePath -Value $newContent -Encoding UTF8 -NoNewline
+$backup = "$target.bak.$(Get-Date -Format yyyyMMdd-HHmmss)"
+Copy-Item -Path $target -Destination $backup -Force
+Set-Content -Path $target -Value $newContent -Encoding UTF8 -NoNewline
 
-Write-Host "Updated: $enginePath"
+Write-Host "Updated: $target"
 Write-Host "Backup : $backup"
