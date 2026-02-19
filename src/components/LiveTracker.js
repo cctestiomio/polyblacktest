@@ -291,14 +291,14 @@ export default function LiveTracker({ onSaveSession }) {
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
             <p className="text-xs font-mono text-slate-400 dark:text-slate-500 truncate">{slugLabel || "Searching..."}</p>
-            <span className={	ext-xs font-semibold }>
+            <span className="text-xs font-semibold">
               {wsState === "connected" ? "â— WS" : wsState === "error" ? "â— WS ERR" : "â—‹ WS"}
             </span>
           </div>
           <p className="text-sm text-slate-700 dark:text-slate-300 truncate">{question}</p>
         </div>
         <div className="flex gap-2 items-center shrink-0">
-          <span className={px-2 py-0.5 rounded text-xs font-bold }>{status.toUpperCase()}</span>
+          <span className="px-2 py-0.5 rounded text-xs font-bold">{status.toUpperCase()}</span>
           <button onClick={() => startTracking()}
             className="px-3 py-1 bg-indigo-600 hover:bg-indigo-500 text-white rounded text-xs font-semibold">
             Refresh
@@ -338,9 +338,9 @@ export default function LiveTracker({ onSaveSession }) {
 
       {/* Resolved banner */}
       {status === "resolved" && (
-        <div className={ounded-xl p-4 text-center border }>
+        <div className="ounded-xl p-4 text-center border">
             <div>
-              <p className={ont-bold text-xl }>
+              <p className="ont-bold text-xl">
                 {outcome === "UP"   && "â–² RESOLVED UP"}
                 {outcome === "DOWN" && "â–¼ RESOLVED DOWN"}
                 {!outcome           && "UNKNOWN RESULT"}
@@ -402,7 +402,7 @@ function StatCard({ label, value, color }) {
   return (
     <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-3 text-center shadow-sm">
       <p className="text-xs text-slate-400 mb-1">{label}</p>
-      <p className={	ext-xl font-bold font-mono }>{value}</p>
+      <p className="text-xl font-bold font-mono">{value}</p>
     </div>
   );
 }
