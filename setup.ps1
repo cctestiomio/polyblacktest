@@ -1,7 +1,6 @@
-<# patch-livetracker-stats.ps1
-   Fixes invalid JSX in LiveTracker.js like:
-     value={curUp != null ? ${(curUp*100).toFixed(1)}c : "---"}
-   -> value={curUp != null ? (curUp*100).toFixed(1) + "c" : "---"}
+<# patch-livetracker-chartformat.ps1
+   Fixes invalid ${v}s / ${v}c / ${v}s elapsed usages in JSX formatters in:
+   src/components/LiveTracker.js
 #>
 
 param(
@@ -10,7 +9,6 @@ param(
 )
 
 $target = Join-Path $RepoRoot "src\components\LiveTracker.js"
-
 if (-not (Test-Path $target)) {
   Write-Error "Cannot find: $target`nRun from repo root or pass -RepoRoot <path>."
   exit 1
@@ -19,18 +17,34 @@ if (-not (Test-Path $target)) {
 $content  = Get-Content -Path $target -Raw -Encoding UTF8
 $original = $content
 
-# UP price StatCard value fix
-$patternUp = 'value=\{\s*curUp\s*!=\s*null\s*\?\s*\$\{\s*\(\s*curUp\s*\*\s*100\s*\)\s*\.toFixed\(\s*1\s*\)\s*\}\s*c\s*:\s*("|\x27)---\1\s*\}'
-$replaceUp = 'value={curUp != null ? (curUp*100).toFixed(1) + "c" : "---"}'
-$content = [regex]::Replace($content, $patternUp, $replaceUp)
+# XAxis / YAxis tickFormatter: v => ${v}s  /  v => ${v}c
+$content = [regex]::Replace(
+  $content,
+  'tickFormatter=\{\s*v\s*=>\s*\$\{\s*v\s*\}\s*s\s*\}',
+  'tickFormatter={v => `${v}s`}'
+)
+$content = [regex]::Replace(
+  $content,
+  'tickFormatter=\{\s*v\s*=>\s*\$\{\s*v\s*\}\s*c\s*\}',
+  'tickFormatter={v => `${v}c`}'
+)
 
-# DOWN price StatCard value fix
-$patternDown = 'value=\{\s*curDown\s*!=\s*null\s*\?\s*\$\{\s*\(\s*curDown\s*\*\s*100\s*\)\s*\.toFixed\(\s*1\s*\)\s*\}\s*c\s*:\s*("|\x27)---\1\s*\}'
-$replaceDown = 'value={curDown != null ? (curDown*100).toFixed(1) + "c" : "---"}'
-$content = [regex]::Replace($content, $patternDown, $replaceDown)
+# Tooltip formatter: (v, n) => [v != null ? ${v}c : "---", n]
+$content = [regex]::Replace(
+  $content,
+  'formatter=\{\s*\(\s*v\s*,\s*n\s*\)\s*=>\s*\[\s*v\s*!=\s*null\s*\?\s*\$\{\s*v\s*\}\s*c\s*:\s*("|\x27)---\1\s*,\s*n\s*\]\s*\}',
+  'formatter={(v, n) => [v != null ? `${v}c` : "---", n]}'
+)
+
+# Tooltip labelFormatter: v => ${v}s elapsed
+$content = [regex]::Replace(
+  $content,
+  'labelFormatter=\{\s*v\s*=>\s*\$\{\s*v\s*\}\s*s\s*elapsed\s*\}',
+  'labelFormatter={v => `${v}s elapsed`}'
+)
 
 if ($content -eq $original) {
-  Write-Host "No changes made (pattern not found or already fixed)."
+  Write-Host "No changes made (patterns not found or already fixed)."
   exit 0
 }
 
