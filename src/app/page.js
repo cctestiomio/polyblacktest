@@ -5,21 +5,32 @@ import LiveTracker from "../components/LiveTracker";
 import ThemeToggle from "../components/ThemeToggle";
 
 const STORAGE_KEY = "pm_sessions";
+
 function loadSessions() {
   if (typeof window === "undefined") return [];
-  try { return JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "[]"); } catch { return []; }
+  try {
+    return JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "[]");
+  } catch {
+    return [];
+  }
 }
-function saveSessions(sessions) { localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions)); }
+
+function saveSessions(sessions) {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions));
+}
 
 export default function Home() {
   const [sessions, setSessions] = useState(() => loadSessions());
   const [toastMsg, setToastMsg] = useState(null);
 
-  const showToast = (msg) => { setToastMsg(msg); setTimeout(() => setToastMsg(null), 3000); };
+  const showToast = (msg) => {
+    setToastMsg(msg);
+    setTimeout(() => setToastMsg(null), 3000);
+  };
 
   const onSaveSession = useCallback((session) => {
-    setSessions(prev => {
-      const next = [...prev.filter(s => s.slug !== session.slug), session];
+    setSessions((prev) => {
+      const next = [...prev.filter((s) => s.slug !== session.slug), session];
       saveSessions(next);
       return next;
     });
@@ -28,46 +39,49 @@ export default function Home() {
 
   // Manual outcome override for any saved session
   const overrideOutcome = useCallback((slug, outcome) => {
-    setSessions(prev => {
-      const next = prev.map(s => s.slug === slug ? { ...s, outcome } : s);
+    setSessions((prev) => {
+      const next = prev.map((s) => (s.slug === slug ? { ...s, outcome } : s));
       saveSessions(next);
       return next;
     });
-    showToast(`Updated ${slug.replace("btc-updown-5m-","")} -> ${outcome}`);
+    showToast(`Updated ${slug.replace("btc-updown-5m-", "")} -> ${outcome}`);
   }, []);
 
   const downloadSessions = () => {
     if (!sessions.length) return;
-    const blob = new Blob([JSON.stringify(sessions, null, 2)], { type: "application/json" });
+    const blob = new Blob([JSON.stringify(sessions, null, 2)], {
+      type: "application/json",
+    });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
     a.download = `pm_btc5m_${Date.now()}.json`;
     a.click();
   };
 
-const downloadSessionsSeparate = () => {
-  if (!sessions.length) return;
+  const downloadSessionsSeparate = () => {
+    if (!sessions.length) return;
 
-  // One JSON file per session (browser may prompt; this is expected).
-  sessions.forEach((s, i) => {
-    const safeSlug = String(s.slug ?? `session_${i}`)
-      .replace(/[^a-zA-Z0-9._-]+/g, "_")
-      .slice(0, 180);
+    sessions.forEach((s, i) => {
+      const safeSlug = String(s.slug ?? `session_${i}`)
+        .replace(/[^a-zA-Z0-9._-]+/g, "_")
+        .slice(0, 180);
 
-    const ts = s.savedAt ?? Date.now();
-    const filename = `${safeSlug}_${ts}.json`;
+      const ts = s.savedAt ?? Date.now();
+      const filename = `${safeSlug}_${ts}.json`;
 
-    const blob = new Blob([JSON.stringify(s, null, 2)], { type: "application/json" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = filename;
+      const blob = new Blob([JSON.stringify(s, null, 2)], {
+        type: "application/json",
+      });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = filename;
 
-    setTimeout(() => {
-      a.click();
-      setTimeout(() => URL.revokeObjectURL(a.href), 2000);
-    }, i * 200);
-  });
-};
+      setTimeout(() => {
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+      }, i * 200);
+    });
+  };
 
   const clearSessions = () => {
     if (!confirm("Clear all saved sessions from this browser?")) return;
@@ -86,10 +100,22 @@ const downloadSessionsSeparate = () => {
       <nav className="border-b border-[var(--border)] bg-[var(--nav)] backdrop-blur sticky top-0 z-10">
         <div className="max-w-6xl mx-auto px-4 py-3 flex items-center gap-4">
           <span className="font-bold text-lg">PM BTC 5m</span>
-          <span className="text-[var(--text2)] text-sm hidden sm:block">Polymarket Tracker & Backtest</span>
+          <span className="text-[var(--text2)] text-sm hidden sm:block">
+            Polymarket Tracker &amp; Backtest
+          </span>
           <div className="ml-auto flex gap-3 items-center">
-            <Link href="/"         className="text-sm font-semibold text-indigo-600 dark:text-indigo-400">Live</Link>
-            <Link href="/backtest" className="text-sm text-[var(--text2)] hover:text-[var(--text1)]">Backtest</Link>
+            <Link
+              href="/"
+              className="text-sm font-semibold text-indigo-600 dark:text-indigo-400"
+            >
+              Live
+            </Link>
+            <Link
+              href="/backtest"
+              className="text-sm text-[var(--text2)] hover:text-[var(--text1)]"
+            >
+              Backtest
+            </Link>
             <ThemeToggle />
           </div>
         </div>
@@ -105,28 +131,47 @@ const downloadSessionsSeparate = () => {
           <div className="flex items-center gap-3 mb-4">
             <h2 className="text-lg font-bold">Saved Sessions ({sessions.length})</h2>
             <div className="ml-auto flex gap-2">
-              <button onClick={downloadSessions} disabled={!sessions.length}
-                className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-lg text-sm font-semibold">
+              <button
+                onClick={downloadSessions}
+                disabled={!sessions.length}
+                className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-lg text-sm font-semibold"
+              >
                 Download JSON
               </button>
-<button onClick={downloadSessionsSeparate} disabled={!sessions.length} className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-lg text-sm font-semibold">Download All JSON (separate)</button>
-              <button onClick={clearSessions} disabled={!sessions.length}
-                className="px-4 py-1.5 bg-red-100 hover:bg-red-200 dark:bg-red-900/50 dark:hover:bg-red-900 disabled:opacity-40 text-red-700 dark:text-red-400 rounded-lg text-sm font-semibold">
+              <button
+                onClick={downloadSessionsSeparate}
+                disabled={!sessions.length}
+                className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-lg text-sm font-semibold"
+              >
+                Download All JSON (separate)
+              </button>
+              <button
+                onClick={clearSessions}
+                disabled={!sessions.length}
+                className="px-4 py-1.5 bg-red-100 hover:bg-red-200 dark:bg-red-900/50 dark:hover:bg-red-900 disabled:opacity-40 text-red-700 dark:text-red-400 rounded-lg text-sm font-semibold"
+              >
                 Clear
               </button>
             </div>
           </div>
 
           {!sessions.length ? (
-            <p className="text-[var(--text3)] text-sm">No sessions yet. Markets auto-save on resolution.</p>
+            <p className="text-[var(--text3)] text-sm">
+              No sessions yet. Markets auto-save on resolution.
+            </p>
           ) : (
             <div className="space-y-2 max-h-96 overflow-y-auto">
               {[...sessions].reverse().map((s, i) => (
-                <div key={i} className="flex items-center gap-3 bg-[var(--bg2)] rounded-lg px-3 py-2">
-                  <span className="font-mono text-xs text-[var(--text3)] truncate flex-1">{s.slug}</span>
-                  <span className="text-xs text-[var(--text3)] shrink-0">{s.priceHistory?.length ?? 0} pts</span>
-
-                  {/* Manual outcome override buttons */}
+                <div
+                  key={i}
+                  className="flex items-center gap-3 bg-[var(--bg2)] rounded-lg px-3 py-2"
+                >
+                  <span className="font-mono text-xs text-[var(--text3)] truncate flex-1">
+                    {s.slug}
+                  </span>
+                  <span className="text-xs text-[var(--text3)] shrink-0">
+                    {s.priceHistory?.length ?? 0} pts
+                  </span>
                   <div className="flex gap-1 shrink-0">
                     <button
                       onClick={() => overrideOutcome(s.slug, "UP")}
@@ -135,7 +180,9 @@ const downloadSessionsSeparate = () => {
                           ? "bg-green-500 text-white border-green-500"
                           : "bg-transparent border-green-400 text-green-600 dark:text-green-400 hover:bg-green-50 dark:hover:bg-green-900/30"
                       }`}
-                    >UP</button>
+                    >
+                      UP
+                    </button>
                     <button
                       onClick={() => overrideOutcome(s.slug, "DOWN")}
                       className={`px-2 py-0.5 rounded text-xs font-bold border transition ${
@@ -143,12 +190,15 @@ const downloadSessionsSeparate = () => {
                           ? "bg-red-500 text-white border-red-500"
                           : "bg-transparent border-red-400 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/30"
                       }`}
-                    >DOWN</button>
+                    >
+                      DOWN
+                    </button>
                   </div>
                 </div>
               ))}
             </div>
           )}
+
           {sessions.length > 0 && (
             <p className="text-xs text-[var(--text3)] mt-3">
               Click UP / DOWN on any row to correct its outcome before running a backtest.
