@@ -93,12 +93,12 @@ export default function BacktestEngine({ sessions }) {
   const [timeStepSecs, setTimeStepSecs] = useState(5);     // 1,5,10
 
   // Delta options
-  const [useDeltaBuckets, setUseDeltaBuckets] = useState(true);
+  const [useDeltaBuckets, setUseDeltaBuckets] = useState(false);
   const [deltaStepDollars, setDeltaStepDollars] = useState(10); // 5,10,20,50
 
-  const [sortBy, setSortBy] = useState("pl"); // winrate | roi | pl | delta
-  const [topN, setTopN] = useState(100);
-  const [minSamples, setMinSamples] = useState(3);
+  const [sortBy, setSortBy] = useState("winrate"); // winrate | roi | pl | delta
+  const [topN, setTopN] = useState(50);
+  const [minSamples, setMinSamples] = useState(1);
 
   const STAKE = 10;
 

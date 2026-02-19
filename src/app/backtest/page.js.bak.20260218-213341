@@ -1,32 +1,11 @@
 "use client";
-
-        param($m)
-        $inside = $m.Groups[1].Value
-        if ($inside -match '(^|,)\s*useEffect\s*(,|$)') { return $m.Value }
-        return 'import { ' + $inside.Trim() + ', useEffect } from "react";'
-      
+import { useState, useCallback } from "react";
 import Link from "next/link";
 import BacktestEngine from "../../components/BacktestEngine";
 import ThemeToggle from "../../components/ThemeToggle";
 
 export default function BacktestPage() {
-    // PM_AUTOLOAD_BROWSER_BTN: auto-click "Load from this Browser" after 3s
-  useEffect(() => {
-    try {
-      if (typeof window !== "undefined") {
-        if (window.__pmAutoLoadBrowserRan) return;
-        window.__pmAutoLoadBrowserRan = true;
-      }
-    } catch {}
-    const t = setTimeout(() => {
-      try {
-        const btn = document.querySelector('button[data-auto-load="browser"]');
-        if (btn) btn.click();
-      } catch {}
-    }, 3000);
-    return () => clearTimeout(t);
-  }, []);
-const [sessions, setSessions] = useState([]);
+  const [sessions, setSessions] = useState([]);
   const [dragOver, setDragOver] = useState(false);
 
   const processFiles = useCallback(async (files) => {
