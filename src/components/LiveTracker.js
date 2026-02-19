@@ -173,7 +173,7 @@ export default function LiveTracker({ onSaveSession }) {
       // 2. Save Session
       doSave(next, localOutcome);
 
-      // 3. Auto-Advance to Next Slug (next 5m bucket)
+      // 3. Auto-Advance to Next Slug 
       const nextSlugTs = slugTs + 300;
       setNextIn(1);
 
