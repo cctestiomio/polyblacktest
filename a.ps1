@@ -1,34 +1,7 @@
-<# a.ps1
-   Fixes:
-   - Default Entry Price Range to 0.01..0.99
-   - Adds optimal Price+Time chart sorted by win rate (highest->lowest)
-   - Adds what-if lookup (buy UP/DOWN at price+time -> win rate + likely outcome)
-   - Removes mojibake/weird characters (ASCII-only) across src
-   - Patches ALL copies of BacktestEngine.js to avoid "wrong file" problems
-   - Verifies patch applied
-
-   Run:
-     powershell -ExecutionPolicy Bypass -File .\a.ps1
-#>
-
 param(
   [string]$RepoRoot = "",
   [switch]$DryRun
 )
-
-function Write-Utf8NoBom([string]$Path, [string]$Text) {
-  $enc = New-Object System.Text.UTF8Encoding($false)
-  [System.IO.File]::WriteAllText($Path, $Text, $enc)
-}
-
-function Backup-And-Write([string]$Path, [string]$NewText) {
-  if ($DryRun) { Write-Host "DRY RUN: Would write $Path"; return }
-  $backup = "$Path.bak.$(Get-Date -Format yyyyMMdd-HHmmss)"
-  Copy-Item -Path $Path -Destination $backup -Force
-  Write-Utf8NoBom -Path $Path -Text $NewText
-  Write-Host "Patched: $Path"
-  Write-Host "Backup : $backup"
-}
 
 function Find-RepoRoot([string]$StartDir) {
   $dir = (Resolve-Path $StartDir).Path
@@ -40,33 +13,67 @@ function Find-RepoRoot([string]$StartDir) {
   }
 }
 
-function Fix-WeirdText([string]$Text) {
-  # Mojibake + weird symbols -> ASCII
-  $map = [ordered]@{
-    "Ã—"  = "x"
-    "â€“" = "-"
-    "â€”" = "-"
-    "â€¦" = "..."
-    "â‰ˆ" = "~="
-    "â€œ" = '"'
-    "â€" = '"'
-    "â€˜" = "'"
-    "â€™" = "'"
-    "Â "  = " "
-    "Â·"  = " - "
-    "Â¢"  = "c"
-    "â—" = "*"
-    "â—‹" = "o"
-    "â–²" = "^"
-    "â–¼" = "v"
-  }
-  foreach ($k in $map.Keys) { $Text = $Text.Replace($k, $map[$k]) }
+function Write-Utf8NoBom([string]$Path, [byte[]]$Bytes) {
+  if ($DryRun) { return }
+  [System.IO.File]::WriteAllBytes($Path, $Bytes)
+}
 
-  $Text = $Text.Replace("×","x").Replace("–","-").Replace("—","-")
-  $Text = $Text.Replace("¢","c")
-  $Text = $Text.Replace("●","*").Replace("○","o").Replace("▲","^").Replace("▼","v")
-  $Text = $Text.Replace("✓","OK").Replace("✗","X")
-  return $Text
+function Backup-File([string]$Path) {
+  if ($DryRun) { return $null }
+  $bak = "$Path.bak.$(Get-Date -Format yyyyMMdd-HHmmss)"
+  Copy-Item -Path $Path -Destination $bak -Force
+  return $bak
+}
+
+function HexToBytes([string]$hex) {
+  $h = ($hex -replace '[^0-9A-Fa-f]', '')
+  if (($h.Length % 2) -ne 0) { throw "Hex string must have even length: $hex" }
+  $bytes = New-Object byte[] ($h.Length / 2)
+  for ($i=0; $i -lt $bytes.Length; $i++) {
+    $bytes[$i] = [Convert]::ToByte($h.Substring($i*2, 2), 16)
+  }
+  return $bytes
+}
+
+function Replace-Bytes([byte[]]$data, [byte[]]$find, [byte[]]$repl) {
+  if ($find.Length -eq 0) { return ,$data }
+  $out = New-Object System.Collections.Generic.List[byte] ($data.Length)
+  $i = 0
+  while ($i -lt $data.Length) {
+    $match = $false
+    if ($i + $find.Length -le $data.Length) {
+      $match = $true
+      for ($j=0; $j -lt $find.Length; $j++) {
+        if ($data[$i+$j] -ne $find[$j]) { $match = $false; break }
+      }
+    }
+    if ($match) {
+      [void]$out.AddRange($repl)
+      $i += $find.Length
+    } else {
+      [void]$out.Add($data[$i])
+      $i++
+    }
+  }
+  return ,$out.ToArray()
+}
+
+function Normalize-FileBytes([string]$Path, $patterns) {
+  $orig = [System.IO.File]::ReadAllBytes($Path)
+  $cur = $orig
+  foreach ($p in $patterns) {
+    $cur = Replace-Bytes $cur $p.Find $p.Repl
+  }
+  if ($cur.Length -ne $orig.Length -or -not ($cur.SequenceEqual($orig))) {
+    $bak = Backup-File $Path
+    if ($DryRun) {
+      Write-Host "DRY RUN: Would normalize $Path"
+    } else {
+      Write-Utf8NoBom $Path $cur
+      Write-Host "Normalized: $Path"
+      Write-Host "Backup    : $bak"
+    }
+  }
 }
 
 # --- Resolve repo root ---
@@ -75,39 +82,53 @@ if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
 } else {
   $RepoRoot = Find-RepoRoot $RepoRoot
 }
-if (-not $RepoRoot) { throw "Could not find repo root (package.json). Run from repo root or pass -RepoRoot." }
-
+if (-not $RepoRoot) { throw "Could not find repo root (package.json). Run from repo root." }
 Write-Host "RepoRoot: $RepoRoot"
 
-# --- 1) Repo-wide weird character cleanup under src (optional but recommended) ---
+# --- Byte-level mojibake patterns (UTF-8 bytes for the mojibake sequences you showed) ---
+# Notes:
+# - "0â€“1" contains the bytes for "â€“" -> replace with "-"
+# - "Â¢" -> replace with "c"
+# - "Price Ã— Time" can show up as either (C3 83 C2 97) or (C3 83 E2 80 94); replace both with "x"
+$patterns = @(
+  @{ Find = (HexToBytes "C382C2A0"); Repl = [byte[]](0x20) }                            # "Â " (NBSP) -> space
+  @{ Find = (HexToBytes "C382C2A2"); Repl = [byte[]](0x63) }                            # "Â¢" -> "c"
+  @{ Find = (HexToBytes "C382C2B7"); Repl = [byte[]](0x20,0x2D,0x20) }                  # "Â·" -> " - "
+  @{ Find = (HexToBytes "C3A2C280C293"); Repl = [byte[]](0x2D) }                        # "â€“" -> "-"
+  @{ Find = (HexToBytes "C3A2C280C294"); Repl = [byte[]](0x2D) }                        # "â€”" -> "-"
+  @{ Find = (HexToBytes "C3A2C280C2A6"); Repl = [byte[]](0x2E,0x2E,0x2E) }              # "â€¦" -> "..."
+  @{ Find = (HexToBytes "C3A2C289C288"); Repl = [byte[]](0x7E,0x3D) }                   # "â‰ˆ" -> "~="
+  @{ Find = (HexToBytes "C3A2C280C29C"); Repl = [byte[]](0x22) }                        # "â€œ" -> "
+  @{ Find = (HexToBytes "C3A2C280C29D"); Repl = [byte[]](0x22) }                        # "â€" -> "
+  @{ Find = (HexToBytes "C3A2C280C298"); Repl = [byte[]](0x27) }                        # "â€˜" -> '
+  @{ Find = (HexToBytes "C3A2C280C299"); Repl = [byte[]](0x27) }                        # "â€™" -> '
+  @{ Find = (HexToBytes "C3A2C296C2B6"); Repl = [byte[]](0x3E) }                        # "â–¶" -> ">"
+  @{ Find = (HexToBytes "C3A2C29CC293"); Repl = [byte[]](0x4F,0x4B) }                   # "âœ“" -> "OK"
+  @{ Find = (HexToBytes "C3A2C29CC297"); Repl = [byte[]](0x58) }                        # "âœ—" -> "X"
+  @{ Find = (HexToBytes "C3A2C297C28F"); Repl = [byte[]](0x2A) }                        # "â—" -> "*"
+  @{ Find = (HexToBytes "C383C297");     Repl = [byte[]](0x78) }                        # "Ã" + C1-control(0x97) -> "x"
+  @{ Find = (HexToBytes "C383E28094");   Repl = [byte[]](0x78) }                        # "Ã—"(where 2nd is em dash) -> "x"
+)
+
+# --- 1) Normalize mojibake across src (so weird chars disappear) ---
 $srcDir = Join-Path $RepoRoot "src"
 if (Test-Path $srcDir) {
-  $allJs = Get-ChildItem -Path $srcDir -Recurse -File -Include *.js,*.jsx,*.ts,*.tsx -ErrorAction SilentlyContinue
-  foreach ($f in $allJs) {
-    try {
-      $orig = Get-Content -Path $f.FullName -Raw -Encoding UTF8
-      $fixed = Fix-WeirdText $orig
-      if ($fixed -ne $orig) {
-        if ($DryRun) { Write-Host "DRY RUN: Would normalize text in $($f.FullName)"; continue }
-        $backup = "$($f.FullName).bak.$(Get-Date -Format yyyyMMdd-HHmmss)"
-        Copy-Item $f.FullName $backup -Force
-        Write-Utf8NoBom $f.FullName $fixed
-        Write-Host "Normalized text: $($f.FullName)"
-      }
-    } catch {}
+  $files = Get-ChildItem -Path $srcDir -Recurse -File -Include *.js,*.jsx,*.ts,*.tsx -ErrorAction SilentlyContinue
+  foreach ($f in $files) {
+    try { Normalize-FileBytes $f.FullName $patterns } catch {}
   }
 } else {
-  Write-Host "WARNING: src/ not found. Skipping repo-wide text normalization."
+  Write-Host "WARNING: src\ not found, skipping normalization."
 }
 
-# --- 2) Patch ALL BacktestEngine.js copies ---
+# --- 2) Overwrite ALL BacktestEngine.js copies with clean ASCII-only implementation ---
 $engineFiles = Get-ChildItem -Path $RepoRoot -Recurse -File -Filter "BacktestEngine.js" -ErrorAction SilentlyContinue
-if (-not $engineFiles -or $engineFiles.Count -eq 0) { throw "Could not find any BacktestEngine.js in repo." }
+if (-not $engineFiles -or $engineFiles.Count -eq 0) { throw "No BacktestEngine.js found in repo." }
 
-Write-Host "Found BacktestEngine.js files:"
+Write-Host "BacktestEngine.js files found:"
 $engineFiles | ForEach-Object { Write-Host " - $($_.FullName)" }
 
-$engineNew = @'
+$engineText = @'
 "use client";
 import { useMemo, useState } from "react";
 import {
@@ -121,31 +142,36 @@ function clamp(n, lo, hi) {
   return Math.min(hi, Math.max(lo, x));
 }
 
-function fmtUsdFromCent(cent) {
-  return `$${(cent / 100).toFixed(2)}`;
+function fmtPrice01(p01) {
+  const p = clamp(p01, 0, 1);
+  return `$${p.toFixed(2)}`;
 }
 
 function fmtTime(sec) {
-  const s = Math.max(0, Math.min(300, Math.round(sec)));
+  const s = clamp(Math.round(sec), 0, 300);
   const m = Math.floor(s / 60);
   const r = String(s % 60).padStart(2, "0");
   return `${m}m${r}s`;
 }
 
+function opposite(side) {
+  return side === "UP" ? "DOWN" : "UP";
+}
+
 export default function BacktestEngine({ sessions }) {
-  // Defaults requested: 0.01..0.99
+  // Defaults requested: 0.01 - 0.99
   const [buySide, setBuySide] = useState("BOTH"); // UP, DOWN, BOTH
   const [priceMin, setPriceMin] = useState(0.01);
   const [priceMax, setPriceMax] = useState(0.99);
   const [elapsedMin, setElapsedMin] = useState(0);
   const [elapsedMax, setElapsedMax] = useState(300);
 
-  // Ranking output: best (side + price + time) combos
+  // Output controls
   const [rankSide, setRankSide] = useState("BOTH"); // UP, DOWN, BOTH
   const [topN, setTopN] = useState(30);
   const [minSamples, setMinSamples] = useState(10);
 
-  // What-if query
+  // What-if lookup
   const [qSide, setQSide] = useState("UP");
   const [qPrice, setQPrice] = useState(0.60);
   const [qElapsed, setQElapsed] = useState(120);
@@ -166,15 +192,15 @@ export default function BacktestEngine({ sessions }) {
 
   const runBacktest = () => {
     const sides = buySide === "BOTH" ? ["UP", "DOWN"] : [buySide];
+
     const trades = [];
-    const comboBySide = { UP: new Map(), DOWN: new Map() }; // key=sec*100+cent
+    const comboBySide = { UP: new Map(), DOWN: new Map() }; // key = sec*100 + cent
 
     for (const session of sessions) {
       const outcome = session?.outcome;
       if (!outcome) continue;
 
-      const points = Array.isArray(session?.priceHistory) ? session.priceHistory : [];
-      for (const point of points) {
+      for (const point of session.priceHistory ?? []) {
         const el = point?.elapsed ?? 0;
         if (el < normalized.eMin || el > normalized.eMax) continue;
 
@@ -188,7 +214,8 @@ export default function BacktestEngine({ sessions }) {
           if (cent < 1 || cent > 99) continue;
 
           const win = outcome === s;
-          trades.push({ slug: session?.slug ?? "?", sec, cent, side: s, outcome, win });
+
+          trades.push({ sec, cent, side: s, win });
 
           const key = (sec * 100) + cent;
           const m = comboBySide[s];
@@ -205,8 +232,8 @@ export default function BacktestEngine({ sessions }) {
       return;
     }
 
-    const totalWins = trades.reduce((acc, t) => acc + (t.win ? 1 : 0), 0);
-    const overallWr = totalWins / trades.length;
+    const wins = trades.reduce((acc, t) => acc + (t.win ? 1 : 0), 0);
+    const wr = wins / trades.length;
 
     let pool = [];
     if (rankSide === "BOTH") pool = [...comboBySide.UP.values(), ...comboBySide.DOWN.values()];
@@ -215,17 +242,30 @@ export default function BacktestEngine({ sessions }) {
     const bestCombos = pool
       .filter(x => x.total >= normalized.minSamples)
       .map(x => {
-        const wr = (x.wins / x.total) * 100;
+        const winRate = (x.wins / x.total) * 100;
+        const price01 = x.cent / 100;
         const label = (rankSide === "BOTH")
-          ? `${x.side} ${fmtUsdFromCent(x.cent)} @ ${fmtTime(x.sec)}`
-          : `${fmtUsdFromCent(x.cent)} @ ${fmtTime(x.sec)}`;
-        return { label, side: x.side, sec: x.sec, cent: x.cent, wins: x.wins, total: x.total, winRate: +wr.toFixed(1) };
+          ? `${x.side} ${fmtPrice01(price01)} @ ${fmtTime(x.sec)}`
+          : `${fmtPrice01(price01)} @ ${fmtTime(x.sec)}`;
+
+        const likelyOutcome = (winRate >= 50) ? x.side : opposite(x.side);
+
+        return {
+          label,
+          winRate: +winRate.toFixed(1),
+          wins: x.wins,
+          total: x.total,
+          side: x.side,
+          sec: x.sec,
+          cent: x.cent,
+          likelyOutcome
+        };
       })
       .sort((a, b) => (b.winRate - a.winRate) || (b.total - a.total) || (a.sec - b.sec) || (a.cent - b.cent))
       .slice(0, normalized.topN);
 
     setResults({
-      summary: { total: trades.length, wins: totalWins, winRate: overallWr },
+      summary: { total: trades.length, wins, winRate: wr },
       bestCombos,
       comboBySide
     });
@@ -237,26 +277,30 @@ export default function BacktestEngine({ sessions }) {
     const side = qSide;
     const sec = clamp(Math.round(qElapsed), 0, 300);
     const cent = clamp(Math.round(clamp(qPrice, 0, 1) * 100), 0, 100);
-    if (cent < 1 || cent > 99) return { ok: false, msg: "Pick a price that rounds to 0.01 - 0.99." };
+    if (cent < 1 || cent > 99) return { ok: false, msg: "Price must round to 0.01 - 0.99." };
 
     const key = (sec * 100) + cent;
     const cell = results.comboBySide[side].get(key);
-    if (!cell || !cell.total) return { ok: false, msg: "No samples for that exact price+time." };
+    if (!cell || !cell.total) return { ok: false, msg: "No samples for that exact price+time. Try nearby values." };
 
-    const wr = (cell.wins / cell.total) * 100;
-    const likelyOutcome = (wr >= 50) ? side : (side === "UP" ? "DOWN" : "UP");
+    const winRate = (cell.wins / cell.total) * 100;
+    const likelyOutcome = (winRate >= 50) ? side : opposite(side);
 
     return {
       ok: true,
       side,
-      priceStr: fmtUsdFromCent(cent),
+      priceStr: fmtPrice01(cent / 100),
       timeStr: fmtTime(sec),
-      winRate: +wr.toFixed(1),
+      winRate: +winRate.toFixed(1),
       wins: cell.wins,
       total: cell.total,
       likelyOutcome
     };
   }, [results, qSide, qPrice, qElapsed]);
+
+  const chartHeight = results?.bestCombos
+    ? Math.max(520, 190 + (results.bestCombos.length * 18))
+    : 520;
 
   return (
     <div className="space-y-6">
@@ -343,8 +387,11 @@ export default function BacktestEngine({ sessions }) {
               <div className="grid grid-cols-3 gap-3">
                 <SCard label="Total Trades" value={results.summary.total} color="text-blue-600 dark:text-blue-400" />
                 <SCard label="Wins" value={results.summary.wins} color="text-green-600 dark:text-green-400" />
-                <SCard label="Win Rate" value={`${(results.summary.winRate*100).toFixed(1)}%`}
-                  color={results.summary.winRate >= 0.5 ? "text-green-600 dark:text-green-400" : "text-red-600 dark:text-red-400"} />
+                <SCard
+                  label="Win Rate"
+                  value={`${(results.summary.winRate * 100).toFixed(1)}%`}
+                  color={results.summary.winRate >= 0.5 ? "text-green-600 dark:text-green-400" : "text-red-600 dark:text-red-400"}
+                />
               </div>
 
               <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-4 shadow-sm space-y-3">
@@ -384,18 +431,18 @@ export default function BacktestEngine({ sessions }) {
                 </div>
               </div>
 
-              <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-4 shadow-sm" style={{ height: 560 }}>
+              <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-4 shadow-sm" style={{ height: chartHeight }}>
                 <p className="text-sm font-bold mb-2">Best price+time combos (sorted highest to lowest win rate)</p>
                 <ResponsiveContainer width="100%" height="92%">
                   <BarChart data={results.bestCombos} layout="vertical" margin={{ left: 20, right: 20, top: 10, bottom: 10 }}>
                     <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
                     <XAxis type="number" domain={[0, 100]} tickFormatter={(v) => `${v}%`} stroke="#94a3b8" tick={{ fontSize: 11 }} />
-                    <YAxis type="category" dataKey="label" width={210} stroke="#94a3b8" tick={{ fontSize: 11 }} />
+                    <YAxis type="category" dataKey="label" width={240} stroke="#94a3b8" tick={{ fontSize: 11 }} />
                     <Tooltip
                       formatter={(v, n, ctx) => {
                         const p = ctx?.payload;
                         if (!p) return [v, n];
-                        return [`${p.winRate}% (wins=${p.wins}, n=${p.total})`, "Win Rate"];
+                        return [`${p.winRate}% (wins=${p.wins}, n=${p.total}), likely outcome=${p.likelyOutcome}`, "Win Rate"];
                       }}
                       contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 8 }}
                     />
@@ -429,21 +476,32 @@ function SCard({ label, value, color }) {
 }
 '@
 
-$engineNew = Fix-WeirdText $engineNew
-
-foreach ($f in $engineFiles) {
-  Backup-And-Write $f.FullName $engineNew
+# Ensure engine text is ASCII-only bytes
+$engineBytes = [System.Text.Encoding]::UTF8.GetBytes($engineText)
+if (($engineBytes | Measure-Object -Maximum).Maximum -gt 127) {
+  throw "Internal error: engine text not ASCII-only."
 }
 
-# --- 3) Verify patch markers exist in each BacktestEngine.js ---
+foreach ($f in $engineFiles) {
+  $bak = Backup-File $f.FullName
+  if ($DryRun) {
+    Write-Host "DRY RUN: Would overwrite $($f.FullName)"
+  } else {
+    Write-Utf8NoBom $f.FullName $engineBytes
+    Write-Host "Overwrote: $($f.FullName)"
+    Write-Host "Backup   : $bak"
+  }
+}
+
+# --- 3) Verify patch applied ---
 if (-not $DryRun) {
   foreach ($f in $engineFiles) {
-    $t = Get-Content -Path $f.FullName -Raw -Encoding UTF8
-    if (($t -notmatch 'useState\(0\.01\)') -or ($t -notmatch 'Best price\+time combos')) {
-      throw "Verification failed for: $($f.FullName) (markers not found after patch)"
+    $t = [System.IO.File]::ReadAllText($f.FullName, [System.Text.Encoding]::UTF8)
+    if ($t -notmatch 'useState\(0\.01\)' -or $t -notmatch 'Best price\+time combos') {
+      throw "Verification failed for $($f.FullName): markers missing."
     }
     Write-Host "Verified: $($f.FullName)"
   }
 }
 
-Write-Host "All done."
+Write-Host "Done. Restart your dev server to see changes (Ctrl+C then npm run dev)."

@@ -386,7 +386,7 @@ export default function LiveTracker({ onSaveSession }) {
       </div>
 
       <div className="flex items-center justify-between">
-        <p className="text-xs text-slate-400">{priceHistory.length} pts  -  {pricedPts} priced  -  WS <span className={wsColor}>{wsState}</span></p>
+        <p className="text-xs text-slate-400">{priceHistory.length} pts Â· {pricedPts} priced Â· WS <span className={wsColor}>{wsState}</span></p>
         <button
           onClick={() => doSave(historyRef.current, outcome)}
           disabled={priceHistory.length === 0}

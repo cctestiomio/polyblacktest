@@ -1,12 +1,9 @@
-﻿"use client";
-import { useState } from "react";
+"use client";
+import { useMemo, useState } from "react";
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid,
-  ResponsiveContainer, Cell, LineChart, Line,
+  ResponsiveContainer, Cell
 } from "recharts";
-
-const PRICE_CENTS = Array.from({ length: 99 }, (_, i) => i + 1);  // 1..99
-const TIME_SECS   = Array.from({ length: 301 }, (_, i) => i);     // 0..300
 
 function clamp(n, lo, hi) {
   const x = Number(n);
@@ -14,126 +11,165 @@ function clamp(n, lo, hi) {
   return Math.min(hi, Math.max(lo, x));
 }
 
-function colorForWinRate01(wr) {
-  // wr: 0..1
-  // Neutral around 0.5, more saturated as you move away.
-  const t = Math.min(1, Math.abs(wr - 0.5) * 2); // 0..1
-  const hue = wr >= 0.5 ? 140 : 0;               // green vs red
-  const sat = 70;
-  const light = 92 - (t * 45);                   // 92..47
-  return `hsl(${hue}, ${sat}%, ${light}%)`;
+function fmtPrice01(p01) {
+  const p = clamp(p01, 0, 1);
+  return `$${p.toFixed(2)}`;
+}
+
+function fmtTime(sec) {
+  const s = clamp(Math.round(sec), 0, 300);
+  const m = Math.floor(s / 60);
+  const r = String(s % 60).padStart(2, "0");
+  return `${m}m${r}s`;
+}
+
+function opposite(side) {
+  return side === "UP" ? "DOWN" : "UP";
 }
 
 export default function BacktestEngine({ sessions }) {
-  const [side, setSide] = useState("UP"); // UP, DOWN, BOTH
-  const [priceMin, setPriceMin] = useState(0.10);
-  const [priceMax, setPriceMax] = useState(0.90);
+  // Defaults requested: 0.01 - 0.99
+  const [buySide, setBuySide] = useState("BOTH"); // UP, DOWN, BOTH
+  const [priceMin, setPriceMin] = useState(0.01);
+  const [priceMax, setPriceMax] = useState(0.99);
   const [elapsedMin, setElapsedMin] = useState(0);
   const [elapsedMax, setElapsedMax] = useState(300);
-  const [groupBy, setGroupBy] = useState("priceRange"); // priceRange | elapsedRange | priceTime
+
+  // Output controls
+  const [rankSide, setRankSide] = useState("BOTH"); // UP, DOWN, BOTH
+  const [topN, setTopN] = useState(30);
+  const [minSamples, setMinSamples] = useState(10);
+
+  // What-if lookup
+  const [qSide, setQSide] = useState("UP");
+  const [qPrice, setQPrice] = useState(0.60);
+  const [qElapsed, setQElapsed] = useState(120);
+
   const [results, setResults] = useState(null);
 
-  const runBacktest = () => {
+  const normalized = useMemo(() => {
     const pMin = clamp(Math.min(priceMin, priceMax), 0, 1);
     const pMax = clamp(Math.max(priceMin, priceMax), 0, 1);
     const eMin = clamp(Math.min(elapsedMin, elapsedMax), 0, 300);
     const eMax = clamp(Math.max(elapsedMin, elapsedMax), 0, 300);
+    return {
+      pMin, pMax, eMin, eMax,
+      topN: clamp(topN, 5, 200),
+      minSamples: clamp(minSamples, 1, 1000000)
+    };
+  }, [priceMin, priceMax, elapsedMin, elapsedMax, topN, minSamples]);
 
-    const sides = side === "BOTH" ? ["UP", "DOWN"] : [side];
+  const runBacktest = () => {
+    const sides = buySide === "BOTH" ? ["UP", "DOWN"] : [buySide];
+
     const trades = [];
+    const comboBySide = { UP: new Map(), DOWN: new Map() }; // key = sec*100 + cent
 
     for (const session of sessions) {
-      if (!session?.outcome) continue;
+      const outcome = session?.outcome;
+      if (!outcome) continue;
 
       for (const point of session.priceHistory ?? []) {
         const el = point?.elapsed ?? 0;
-        if (el < eMin || el > eMax) continue;
+        if (el < normalized.eMin || el > normalized.eMax) continue;
 
         for (const s of sides) {
-          const price = s === "DOWN" ? point?.down : point?.up;
+          const price = (s === "DOWN") ? point?.down : point?.up;
           if (price == null) continue;
-          if (price < pMin || price > pMax) continue;
+          if (price < normalized.pMin || price > normalized.pMax) continue;
 
-          const win = session.outcome === s;
-          trades.push({
-            slug: session.slug,
-            elapsed: el,
-            price,
-            side: s,
-            outcome: session.outcome,
-            win,
-          });
+          const sec = clamp(Math.round(el), 0, 300);
+          const cent = clamp(Math.round(price * 100), 0, 100);
+          if (cent < 1 || cent > 99) continue;
+
+          const win = outcome === s;
+
+          trades.push({ sec, cent, side: s, win });
+
+          const key = (sec * 100) + cent;
+          const m = comboBySide[s];
+          const cur = m.get(key) ?? { wins: 0, total: 0, sec, cent, side: s };
+          cur.total++;
+          if (win) cur.wins++;
+          m.set(key, cur);
         }
       }
     }
 
     if (!trades.length) {
-      setResults({ trades: [], summary: null, chartPrice: [], chartTime: [], heat: new Map() });
+      setResults({ summary: null, bestCombos: [], comboBySide });
       return;
     }
 
     const wins = trades.reduce((acc, t) => acc + (t.win ? 1 : 0), 0);
-    const winRate = wins / trades.length;
+    const wr = wins / trades.length;
 
-    // --- Build 1Â¢ price chart (1..99) ---
-    const byCent = new Array(100).fill(null).map(() => ({ wins: 0, total: 0 }));
-    // --- Build 1s time chart (0..300) ---
-    const bySec = new Array(301).fill(null).map(() => ({ wins: 0, total: 0 }));
-    // --- Build heatmap (sec x cent) ---
-    const heat = new Map(); // key = sec*100 + cent
+    let pool = [];
+    if (rankSide === "BOTH") pool = [...comboBySide.UP.values(), ...comboBySide.DOWN.values()];
+    else pool = [...comboBySide[rankSide].values()];
 
-    for (const t of trades) {
-      const cent = clamp(Math.round(t.price * 100), 0, 100);
-      const sec = clamp(Math.round(t.elapsed), 0, 300);
+    const bestCombos = pool
+      .filter(x => x.total >= normalized.minSamples)
+      .map(x => {
+        const winRate = (x.wins / x.total) * 100;
+        const price01 = x.cent / 100;
+        const label = (rankSide === "BOTH")
+          ? `${x.side} ${fmtPrice01(price01)} @ ${fmtTime(x.sec)}`
+          : `${fmtPrice01(price01)} @ ${fmtTime(x.sec)}`;
 
-      if (cent >= 1 && cent <= 99) {
-        byCent[cent].total++;
-        if (t.win) byCent[cent].wins++;
-      }
+        const likelyOutcome = (winRate >= 50) ? x.side : opposite(x.side);
 
-      bySec[sec].total++;
-      if (t.win) bySec[sec].wins++;
-
-      if (cent >= 1 && cent <= 99) {
-        const key = (sec * 100) + cent;
-        const cur = heat.get(key) ?? { wins: 0, total: 0 };
-        cur.total++;
-        if (t.win) cur.wins++;
-        heat.set(key, cur);
-      }
-    }
-
-    const chartPrice = PRICE_CENTS.map((c) => {
-      const { wins, total } = byCent[c];
-      return {
-        cent: c,
-        label: `${c}Â¢`,
-        winRate: total ? +((wins / total) * 100).toFixed(1) : null,
-        wins,
-        total,
-      };
-    });
-
-    const chartTime = TIME_SECS.map((s) => {
-      const { wins, total } = bySec[s];
-      return {
-        sec: s,
-        label: `${s}s`,
-        winRate: total ? +((wins / total) * 100).toFixed(1) : null,
-        wins,
-        total,
-      };
-    });
+        return {
+          label,
+          winRate: +winRate.toFixed(1),
+          wins: x.wins,
+          total: x.total,
+          side: x.side,
+          sec: x.sec,
+          cent: x.cent,
+          likelyOutcome
+        };
+      })
+      .sort((a, b) => (b.winRate - a.winRate) || (b.total - a.total) || (a.sec - b.sec) || (a.cent - b.cent))
+      .slice(0, normalized.topN);
 
     setResults({
-      trades,
-      summary: { total: trades.length, wins, winRate },
-      chartPrice,
-      chartTime,
-      heat,
-      params: { pMin, pMax, eMin, eMax, side },
+      summary: { total: trades.length, wins, winRate: wr },
+      bestCombos,
+      comboBySide
     });
   };
+
+  const whatIf = useMemo(() => {
+    if (!results?.comboBySide) return null;
+
+    const side = qSide;
+    const sec = clamp(Math.round(qElapsed), 0, 300);
+    const cent = clamp(Math.round(clamp(qPrice, 0, 1) * 100), 0, 100);
+    if (cent < 1 || cent > 99) return { ok: false, msg: "Price must round to 0.01 - 0.99." };
+
+    const key = (sec * 100) + cent;
+    const cell = results.comboBySide[side].get(key);
+    if (!cell || !cell.total) return { ok: false, msg: "No samples for that exact price+time. Try nearby values." };
+
+    const winRate = (cell.wins / cell.total) * 100;
+    const likelyOutcome = (winRate >= 50) ? side : opposite(side);
+
+    return {
+      ok: true,
+      side,
+      priceStr: fmtPrice01(cent / 100),
+      timeStr: fmtTime(sec),
+      winRate: +winRate.toFixed(1),
+      wins: cell.wins,
+      total: cell.total,
+      likelyOutcome
+    };
+  }, [results, qSide, qPrice, qElapsed]);
+
+  const chartHeight = results?.bestCombos
+    ? Math.max(520, 190 + (results.bestCombos.length * 18))
+    : 520;
 
   return (
     <div className="space-y-6">
@@ -144,47 +180,29 @@ export default function BacktestEngine({ sessions }) {
           <div>
             <label className="text-xs text-[var(--text2)] block mb-1">Buy Side</label>
             <div className="flex gap-2">
-              {["UP", "DOWN", "BOTH"].map(s => (
-                <button
-                  key={s}
-                  onClick={() => setSide(s)}
+              {["UP","DOWN","BOTH"].map(s => (
+                <button key={s} onClick={() => setBuySide(s)}
                   className={`flex-1 py-2 rounded-lg font-bold text-sm transition ${
-                    side === s
-                      ? "bg-indigo-600 text-white"
-                      : "bg-[var(--bg2)] hover:bg-[var(--bg3)] text-[var(--text1)] border border-[var(--border)]"
-                  }`}
-                >
-                  {s}
-                </button>
+                    buySide === s ? "bg-indigo-600 text-white" : "bg-[var(--bg2)] hover:bg-[var(--bg3)] text-[var(--text1)] border border-[var(--border)]"
+                  }`}>{s}</button>
               ))}
             </div>
           </div>
 
           <div>
-            <label className="text-xs text-[var(--text2)] block mb-1">Chart View</label>
+            <label className="text-xs text-[var(--text2)] block mb-1">Rank combos for</label>
             <div className="flex gap-2">
-              {[
-                ["priceRange", "Entry Price (1Â¢)"],
-                ["elapsedRange", "Elapsed Time (1s)"],
-                ["priceTime", "Price Ã— Time (Heatmap)"],
-              ].map(([v, l]) => (
-                <button
-                  key={v}
-                  onClick={() => setGroupBy(v)}
-                  className={`flex-1 py-2 rounded-lg text-sm transition ${
-                    groupBy === v
-                      ? "bg-indigo-600 text-white"
-                      : "bg-[var(--bg2)] hover:bg-[var(--bg3)] text-[var(--text1)] border border-[var(--border)]"
-                  }`}
-                >
-                  {l}
-                </button>
+              {["UP","DOWN","BOTH"].map(s => (
+                <button key={s} onClick={() => setRankSide(s)}
+                  className={`flex-1 py-2 rounded-lg font-bold text-sm transition ${
+                    rankSide === s ? "bg-indigo-600 text-white" : "bg-[var(--bg2)] hover:bg-[var(--bg3)] text-[var(--text1)] border border-[var(--border)]"
+                  }`}>{s}</button>
               ))}
             </div>
           </div>
 
           <div>
-            <label className="text-xs text-[var(--text2)] block mb-1">Entry Price Range (0â€“1)</label>
+            <label className="text-xs text-[var(--text2)] block mb-1">Entry Price Range (0-1)</label>
             <div className="flex gap-2 items-center">
               <input type="number" min="0" max="1" step="0.01" value={priceMin}
                 onChange={e => setPriceMin(+e.target.value)}
@@ -194,11 +212,11 @@ export default function BacktestEngine({ sessions }) {
                 onChange={e => setPriceMax(+e.target.value)}
                 className="w-24 bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-1.5 text-sm text-[var(--text1)]" />
             </div>
-            <p className="text-xs text-[var(--text3)] mt-1">Tip: set 0.01â€“0.99 to show full domain</p>
+            <p className="text-xs text-[var(--text3)] mt-1">Default is 0.01 to 0.99.</p>
           </div>
 
           <div>
-            <label className="text-xs text-[var(--text2)] block mb-1">Time Elapsed Range (seconds 0â€“300)</label>
+            <label className="text-xs text-[var(--text2)] block mb-1">Time Elapsed Range (seconds 0-300)</label>
             <div className="flex gap-2 items-center">
               <input type="number" min="0" max="300" step="1" value={elapsedMin}
                 onChange={e => setElapsedMin(+e.target.value)}
@@ -209,11 +227,25 @@ export default function BacktestEngine({ sessions }) {
                 className="w-24 bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-1.5 text-sm text-[var(--text1)]" />
             </div>
           </div>
+
+          <div>
+            <label className="text-xs text-[var(--text2)] block mb-1">Top N combos</label>
+            <input type="number" min="5" max="200" step="1" value={topN}
+              onChange={e => setTopN(+e.target.value)}
+              className="w-full bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-2 text-sm text-[var(--text1)]" />
+          </div>
+
+          <div>
+            <label className="text-xs text-[var(--text2)] block mb-1">Min samples per combo (n)</label>
+            <input type="number" min="1" step="1" value={minSamples}
+              onChange={e => setMinSamples(+e.target.value)}
+              className="w-full bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-2 text-sm text-[var(--text1)]" />
+          </div>
         </div>
 
         <button onClick={runBacktest} disabled={sessions.length === 0}
           className="w-full py-3 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-xl font-bold text-base">
-          â–¶ Run Backtest ({sessions.length} session{sessions.length !== 1 ? "s" : ""} loaded)
+          Run Backtest ({sessions.length} session{sessions.length !== 1 ? "s" : ""} loaded)
         </button>
       </div>
 
@@ -231,157 +263,70 @@ export default function BacktestEngine({ sessions }) {
                 />
               </div>
 
-              {/* Charts */}
-              {groupBy === "priceRange" && (
-                <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-4 shadow-sm" style={{ height: 340 }}>
-                  <p className="text-xs text-[var(--text2)] mb-3">Win Rate by Entry Price (1Â¢ increments)</p>
-                  <ResponsiveContainer width="100%" height="90%">
-                    <BarChart data={results.chartPrice}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-                      <XAxis
-                        dataKey="cent"
-                        stroke="#94a3b8"
-                        tick={{ fontSize: 10 }}
-                        tickFormatter={(v) => `${v}Â¢`}
-                        interval={0}
-                        angle={-60}
-                        textAnchor="end"
-                        height={80}
-                      />
-                      <YAxis domain={[0, 100]} tickFormatter={v => `${v}%`} stroke="#94a3b8" tick={{ fontSize: 11 }} />
-                      <Tooltip
-                        formatter={(v, n, ctx) => {
-                          const p = ctx?.payload;
-                          if (!p) return [v, n];
-                          if (n === "winRate") return [p.total ? `${p.winRate}%` : "â€”", "Win Rate"];
-                          return [v, n];
-                        }}
-                        labelFormatter={(cent) => `${cent}Â¢`}
-                        contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 8 }}
-                      />
-                      <Bar dataKey="winRate" radius={[3, 3, 0, 0]}>
-                        {results.chartPrice.map((e, i) => (
-                          <Cell key={i} fill={e.winRate == null ? "rgba(148,163,184,0.25)" : (e.winRate >= 50 ? "#16a34a" : "#dc2626")} />
-                        ))}
-                      </Bar>
-                    </BarChart>
-                  </ResponsiveContainer>
-                </div>
-              )}
-
-              {groupBy === "elapsedRange" && (
-                <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-4 shadow-sm" style={{ height: 340 }}>
-                  <p className="text-xs text-[var(--text2)] mb-3">Win Rate by Elapsed Time (1s increments)</p>
-                  <ResponsiveContainer width="100%" height="90%">
-                    <LineChart data={results.chartTime}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-                      <XAxis
-                        dataKey="sec"
-                        stroke="#94a3b8"
-                        tick={{ fontSize: 11 }}
-                        tickFormatter={(v) => `${v}s`}
-                        interval={29} /* keep chart readable; data is still 1s resolution */
-                      />
-                      <YAxis domain={[0, 100]} tickFormatter={v => `${v}%`} stroke="#94a3b8" tick={{ fontSize: 11 }} />
-                      <Tooltip
-                        formatter={(v, n, ctx) => {
-                          const p = ctx?.payload;
-                          if (!p) return [v, n];
-                          return [p.total ? `${p.winRate}% (n=${p.total})` : "â€”", "Win Rate"];
-                        }}
-                        labelFormatter={(sec) => `${sec}s`}
-                        contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 8 }}
-                      />
-                      <Line type="monotone" dataKey="winRate" stroke="#6366f1" dot={false} connectNulls={false} strokeWidth={2} />
-                    </LineChart>
-                  </ResponsiveContainer>
-                </div>
-              )}
-
-              {groupBy === "priceTime" && (
-                <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-4 shadow-sm">
-                  <p className="text-xs text-[var(--text2)] mb-3">Win Rate Heatmap (Price Ã— Time)</p>
-
-                  <div className="text-xs text-[var(--text3)] mb-3">
-                    X-axis: elapsed seconds (0â€“300). Y-axis: entry price cents (1â€“99). Hover cells for details.
+              <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-4 shadow-sm space-y-3">
+                <p className="text-sm font-bold">What-if lookup (exact price + exact time)</p>
+                <div className="grid grid-cols-1 sm:grid-cols-4 gap-3 items-end">
+                  <div>
+                    <label className="text-xs text-[var(--text2)] block mb-1">Buy token</label>
+                    <select value={qSide} onChange={e => setQSide(e.target.value)}
+                      className="w-full bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-2 text-sm text-[var(--text1)]">
+                      <option value="UP">UP (YES)</option>
+                      <option value="DOWN">DOWN (NO)</option>
+                    </select>
                   </div>
-
-                  <div className="w-full border border-[var(--border)] rounded-lg overflow-hidden" style={{ height: 420 }}>
-                    <svg
-                      viewBox="0 0 301 99"
-                      preserveAspectRatio="none"
-                      width="100%"
-                      height="100%"
-                    >
-                      {/* background */}
-                      <rect x="0" y="0" width="301" height="99" fill="rgba(148,163,184,0.08)" />
-
-                      {Array.from(results.heat.entries()).map(([key, v]) => {
-                        const sec = Math.floor(key / 100);
-                        const cent = key % 100;
-                        if (cent < 1 || cent > 99) return null;
-
-                        const wr01 = v.total ? (v.wins / v.total) : 0.5;
-                        const fill = colorForWinRate01(wr01);
-
-                        // y=0 at top, we want 99Â¢ near top, 1Â¢ near bottom
-                        const y = (99 - cent);
-
-                        return (
-                          <g key={key}>
-                            <rect x={sec} y={y} width="1" height="1" fill={fill} opacity="0.95">
-                              <title>{`t=${sec}s, price=${cent}Â¢, winRate=${(wr01*100).toFixed(1)}% (wins=${v.wins}, n=${v.total})`}</title>
-                            </rect>
-                          </g>
-                        );
-                      })}
-                    </svg>
+                  <div>
+                    <label className="text-xs text-[var(--text2)] block mb-1">Entry price (0-1)</label>
+                    <input type="number" min="0" max="1" step="0.01" value={qPrice}
+                      onChange={e => setQPrice(+e.target.value)}
+                      className="w-full bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-2 text-sm text-[var(--text1)]" />
                   </div>
+                  <div>
+                    <label className="text-xs text-[var(--text2)] block mb-1">Elapsed seconds (0-300)</label>
+                    <input type="number" min="0" max="300" step="1" value={qElapsed}
+                      onChange={e => setQElapsed(+e.target.value)}
+                      className="w-full bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-2 text-sm text-[var(--text1)]" />
+                  </div>
+                  <div className="text-sm">
+                    {whatIf?.ok ? (
+                      <div className="rounded-lg border border-[var(--border)] bg-[var(--bg2)] px-3 py-2">
+                        <div className="font-semibold">{whatIf.side} at {whatIf.priceStr} and {whatIf.timeStr}</div>
+                        <div>Historical win rate: {whatIf.winRate}% (wins={whatIf.wins}, n={whatIf.total})</div>
+                        <div>Likely outcome: {whatIf.likelyOutcome}</div>
+                      </div>
+                    ) : (
+                      <div className="text-[var(--text3)]">{whatIf?.msg ?? "Run a backtest to enable lookup."}</div>
+                    )}
+                  </div>
+                </div>
+              </div>
 
-                  <div className="mt-3 text-xs text-[var(--text3)] flex items-center gap-3">
-                    <span>0%</span>
-                    <div className="flex-1 h-2 rounded"
-                      style={{ background: "linear-gradient(90deg, #dc2626, #eab308, #16a34a)" }}
+              <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-4 shadow-sm" style={{ height: chartHeight }}>
+                <p className="text-sm font-bold mb-2">Best price+time combos (sorted highest to lowest win rate)</p>
+                <ResponsiveContainer width="100%" height="92%">
+                  <BarChart data={results.bestCombos} layout="vertical" margin={{ left: 20, right: 20, top: 10, bottom: 10 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+                    <XAxis type="number" domain={[0, 100]} tickFormatter={(v) => `${v}%`} stroke="#94a3b8" tick={{ fontSize: 11 }} />
+                    <YAxis type="category" dataKey="label" width={240} stroke="#94a3b8" tick={{ fontSize: 11 }} />
+                    <Tooltip
+                      formatter={(v, n, ctx) => {
+                        const p = ctx?.payload;
+                        if (!p) return [v, n];
+                        return [`${p.winRate}% (wins=${p.wins}, n=${p.total}), likely outcome=${p.likelyOutcome}`, "Win Rate"];
+                      }}
+                      contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 8 }}
                     />
-                    <span>100%</span>
-                  </div>
-                </div>
-              )}
-
-              {/* Trade log */}
-              <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-4 shadow-sm">
-                <p className="text-xs text-[var(--text2)] mb-3">Trade Log (last 50)</p>
-                <div className="overflow-x-auto">
-                  <table className="w-full text-xs text-[var(--text1)]">
-                    <thead>
-                      <tr className="text-[var(--text3)] border-b border-[var(--border)]">
-                        <th className="text-left py-1 pr-4">Slug</th>
-                        <th className="text-right pr-4">Elapsed</th>
-                        <th className="text-right pr-4">Price</th>
-                        <th className="text-right pr-4">Side</th>
-                        <th className="text-right pr-4">Outcome</th>
-                        <th className="text-right">Result</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {results.trades.slice(-50).reverse().map((t, i) => (
-                        <tr key={i} className="border-b border-[var(--border)] hover:bg-[var(--bg2)]">
-                          <td className="py-1 pr-4 truncate max-w-xs font-mono text-[var(--text3)]">{t.slug}</td>
-                          <td className="text-right pr-4">{Math.round(t.elapsed)}s</td>
-                          <td className="text-right pr-4">{(t.price * 100).toFixed(2)}Â¢</td>
-                          <td className={`text-right pr-4 font-bold ${t.side === "UP" ? "text-green-600" : "text-red-600"}`}>{t.side}</td>
-                          <td className={`text-right pr-4 font-bold ${t.outcome === "UP" ? "text-green-600" : "text-red-600"}`}>{t.outcome}</td>
-                          <td className={`text-right font-bold ${t.win ? "text-green-600" : "text-red-600"}`}>{t.win ? "âœ“" : "âœ—"}</td>
-                        </tr>
+                    <Bar dataKey="winRate" radius={[4,4,4,4]}>
+                      {results.bestCombos.map((e, i) => (
+                        <Cell key={i} fill={e.winRate >= 50 ? "#16a34a" : "#dc2626"} />
                       ))}
-                    </tbody>
-                  </table>
-                </div>
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
               </div>
             </>
           ) : (
             <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-6 text-center text-[var(--text3)]">
-              No matching trades. Widen your price/time range, or ensure sessions have outcomes detected.
+              No matching trades.
             </div>
           )}
         </div>
