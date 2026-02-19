@@ -28,7 +28,7 @@ def current_resolution_ts():
     return math.ceil(now / 300) * 300
 
 def market_slug(ts):
-    return f"btc-up-or-down-in-5-minutes-{ts}"
+    return f"btc-updown-5m-{ts}"
 
 def fetch_market(slug):
     try:
