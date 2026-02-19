@@ -1,11 +1,13 @@
-<# patch-ui-heatmap-hover-and-mojibake.ps1
-   - Replaces BacktestEngine.js with a heatmap that supports hover tooltip via mouse position.
-   - Fixes common mojibake sequences across tracker/backtest files.
-   - Writes files as UTF-8 (no BOM) and creates timestamped backups.
+<# patch-backtestengine-best-combos.ps1
+   - Overwrites src/components/BacktestEngine.js
+   - Defaults Entry Price Range to 0.01 .. 0.99
+   - After "Run Backtest", computes best (price cent + elapsed second) combos and shows them
+     sorted by win rate (highest -> lowest) in a bar chart.
+   - Also includes 1c and 1s charts and a simple mojibake-fix pass on key UI files.
 
    Usage:
-     .\patch-ui-heatmap-hover-and-mojibake.ps1
-     .\patch-ui-heatmap-hover-and-mojibake.ps1 -DryRun
+     .\patch-backtestengine-best-combos.ps1
+     .\patch-backtestengine-best-combos.ps1 -DryRun
 #>
 
 param(
@@ -31,39 +33,33 @@ function Backup-And-Write([string]$Path, [string]$NewText) {
 }
 
 function Fix-Mojibake([string]$Text) {
-  # Replace the common garbled sequences + normalize to ASCII where helpful.
   $map = [ordered]@{
-    "Ã—" = "x"     # multiplication sign mojibake
-    "â€“" = "-"     # en dash mojibake
-    "â€”" = "-"     # em dash mojibake
-    "â€¦" = "..."   # ellipsis mojibake
-    "â‰ˆ" = "~="    # approx mojibake
-
-    "â€œ" = '"'     # opening quote mojibake
-    "â€" = '"'     # closing quote mojibake
-    "â€˜" = "'"     # opening apostrophe mojibake
-    "â€™" = "'"     # closing apostrophe mojibake
-
-    "Â "  = " "     # NBSP mojibake
-    "Â·"  = " - "   # middot mojibake -> ASCII-ish separator
-    "Â¢"  = "c"     # cents mojibake -> ASCII
+    # Common mojibake sequences -> ASCII-safe
+    "Ã—" = "x"
+    "â€“" = "-"
+    "â€”" = "-"
+    "â€¦" = "..."
+    "â‰ˆ" = "~="
+    "â€œ" = '"'
+    "â€" = '"'
+    "â€˜" = "'"
+    "â€™" = "'"
+    "Â "  = " "
+    "Â¢"  = "c"
+    "Â·"  = " - "
   }
-
   foreach ($k in $map.Keys) { $Text = $Text.Replace($k, $map[$k]) }
 
-  # Also normalize a few legit-but-non-ASCII characters to avoid future encoding issues
-  $Text = $Text.Replace("¢", "c")
-  $Text = $Text.Replace("✓", "W")
-  $Text = $Text.Replace("✗", "L")
-  $Text = $Text.Replace("●", "*")
-  $Text = $Text.Replace("○", "o")
-  $Text = $Text.Replace("▲", "^")
-  $Text = $Text.Replace("▼", "v")
+  # Normalize a few symbols so you don't fight encoding again
+  $Text = $Text.Replace("¢","c")
+  $Text = $Text.Replace("×","x")
+  $Text = $Text.Replace("–","-")
+  $Text = $Text.Replace("—","-")
 
   return $Text
 }
 
-# --- 1) Overwrite BacktestEngine.js with hoverable heatmap + cleaner strings ---
+# -------- Overwrite BacktestEngine.js --------
 $enginePath = Join-Path $RepoRoot "src\components\BacktestEngine.js"
 if (-not (Test-Path $enginePath)) {
   Write-Error "Cannot find: $enginePath"
@@ -72,10 +68,10 @@ if (-not (Test-Path $enginePath)) {
 
 $engineNew = @'
 "use client";
-import { useMemo, useRef, useState } from "react";
+import { useMemo, useState } from "react";
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid,
-  ResponsiveContainer, Cell, LineChart, Line
+  ResponsiveContainer, Cell, LineChart, Line,
 } from "recharts";
 
 const PRICE_CENTS = Array.from({ length: 99 }, (_, i) => i + 1); // 1..99
@@ -87,43 +83,39 @@ function clamp(n, lo, hi) {
   return Math.min(hi, Math.max(lo, x));
 }
 
-function colorForWinRate01(wr) {
-  // wr: 0..1, neutral around 0.5
-  const t = Math.min(1, Math.abs(wr - 0.5) * 2); // 0..1
-  const hue = wr >= 0.5 ? 140 : 0;               // green vs red
-  const sat = 70;
-  const light = 92 - (t * 45);                   // 92..47
-  return `hsl(${hue}, ${sat}%, ${light}%)`;
-}
-
 export default function BacktestEngine({ sessions }) {
-  const [side, setSide] = useState("UP"); // UP, DOWN, BOTH
-  const [priceMin, setPriceMin] = useState(0.10);
-  const [priceMax, setPriceMax] = useState(0.90);
+  const [side, setSide] = useState("UP");          // UP, DOWN, BOTH
+  const [priceMin, setPriceMin] = useState(0.01);  // default per request
+  const [priceMax, setPriceMax] = useState(0.99);  // default per request
   const [elapsedMin, setElapsedMin] = useState(0);
   const [elapsedMax, setElapsedMax] = useState(300);
 
-  const [groupBy, setGroupBy] = useState("priceRange"); // priceRange | elapsedRange | priceTime
-  const [results, setResults] = useState(null);
+  const [view, setView] = useState("bestCombos"); // bestCombos | price | time
+  const [topN, setTopN] = useState(25);
+  const [minSamples, setMinSamples] = useState(10);
 
-  // Heatmap hover
-  const heatWrapRef = useRef(null);
-  const [hover, setHover] = useState(null); // {sec, cent, wins, total, winRate, x, y}
+  const [results, setResults] = useState(null);
 
   const normalized = useMemo(() => {
     const pMin = clamp(Math.min(priceMin, priceMax), 0, 1);
     const pMax = clamp(Math.max(priceMin, priceMax), 0, 1);
     const eMin = clamp(Math.min(elapsedMin, elapsedMax), 0, 300);
     const eMax = clamp(Math.max(elapsedMin, elapsedMax), 0, 300);
-    return { pMin, pMax, eMin, eMax };
-  }, [priceMin, priceMax, elapsedMin, elapsedMax]);
+
+    return {
+      pMin, pMax, eMin, eMax,
+      topN: clamp(topN, 5, 200),
+      minSamples: clamp(minSamples, 1, 1000000),
+    };
+  }, [priceMin, priceMax, elapsedMin, elapsedMax, topN, minSamples]);
 
   const runBacktest = () => {
+    const sides = side === "BOTH" ? ["UP","DOWN"] : [side];
     const trades = [];
-    const sides = side === "BOTH" ? ["UP", "DOWN"] : [side];
 
     for (const session of sessions) {
       if (!session?.outcome) continue;
+
       for (const point of session.priceHistory ?? []) {
         const el = point?.elapsed ?? 0;
         if (el < normalized.eMin || el > normalized.eMax) continue;
@@ -134,22 +126,32 @@ export default function BacktestEngine({ sessions }) {
           if (price < normalized.pMin || price > normalized.pMax) continue;
 
           const win = session.outcome === s;
-          trades.push({ slug: session.slug, elapsed: el, price, side: s, outcome: session.outcome, win });
+          trades.push({
+            slug: session.slug ?? "?",
+            elapsed: el,
+            price,
+            side: s,
+            outcome: session.outcome,
+            win,
+          });
         }
       }
     }
 
     if (!trades.length) {
-      setResults({ trades: [], summary: null, chartPrice: [], chartTime: [], heat: new Map() });
+      setResults({ trades: [], summary: null, chartPrice: [], chartTime: [], bestCombos: [] });
       return;
     }
 
     const wins = trades.reduce((acc, t) => acc + (t.win ? 1 : 0), 0);
     const winRate = wins / trades.length;
 
+    // --- 1c chart ---
     const byCent = new Array(100).fill(null).map(() => ({ wins: 0, total: 0 }));
+    // --- 1s chart ---
     const bySec = new Array(301).fill(null).map(() => ({ wins: 0, total: 0 }));
-    const heat = new Map(); // key = sec*100 + cent
+    // --- combo stats (sec + cent) ---
+    const combo = new Map(); // key = sec*100 + cent
 
     for (const t of trades) {
       const cent = clamp(Math.round(t.price * 100), 0, 100);
@@ -157,62 +159,59 @@ export default function BacktestEngine({ sessions }) {
 
       if (cent >= 1 && cent <= 99) {
         byCent[cent].total++; if (t.win) byCent[cent].wins++;
-      }
-      bySec[sec].total++; if (t.win) bySec[sec].wins++;
-
-      if (cent >= 1 && cent <= 99) {
         const key = (sec * 100) + cent;
-        const cur = heat.get(key) ?? { wins: 0, total: 0 };
+        const cur = combo.get(key) ?? { wins: 0, total: 0, sec, cent };
         cur.total++; if (t.win) cur.wins++;
-        heat.set(key, cur);
+        combo.set(key, cur);
       }
+
+      bySec[sec].total++; if (t.win) bySec[sec].wins++;
     }
 
     const chartPrice = PRICE_CENTS.map((c) => {
       const { wins, total } = byCent[c];
-      return { cent: c, label: `${c}c`, winRate: total ? +((wins / total) * 100).toFixed(1) : null, wins, total };
+      return {
+        cent: c,
+        label: `${c}c`,
+        winRate: total ? +((wins / total) * 100).toFixed(1) : null,
+        wins,
+        total,
+      };
     });
 
     const chartTime = TIME_SECS.map((s) => {
       const { wins, total } = bySec[s];
-      return { sec: s, label: `${s}s`, winRate: total ? +((wins / total) * 100).toFixed(1) : null, wins, total };
+      return {
+        sec: s,
+        label: `${s}s`,
+        winRate: total ? +((wins / total) * 100).toFixed(1) : null,
+        wins,
+        total,
+      };
     });
+
+    const bestCombos = Array.from(combo.values())
+      .filter(x => x.total >= normalized.minSamples)
+      .map(x => ({
+        sec: x.sec,
+        cent: x.cent,
+        label: `${x.cent}c @ ${x.sec}s`,
+        wins: x.wins,
+        total: x.total,
+        winRate: +((x.wins / x.total) * 100).toFixed(1),
+      }))
+      .sort((a, b) => (b.winRate - a.winRate) || (b.total - a.total) || (a.sec - b.sec) || (a.cent - b.cent))
+      .slice(0, normalized.topN);
 
     setResults({
       trades,
       summary: { total: trades.length, wins, winRate },
       chartPrice,
       chartTime,
-      heat,
-      params: { ...normalized, side }
+      bestCombos,
+      params: { ...normalized, side },
     });
   };
-
-  const onHeatMove = (e) => {
-    if (!results?.heat || !heatWrapRef.current) return;
-    const r = heatWrapRef.current.getBoundingClientRect();
-    const px = e.clientX - r.left;
-    const py = e.clientY - r.top;
-
-    if (px < 0 || py < 0 || px > r.width || py > r.height) { setHover(null); return; }
-
-    // Map pixel -> grid coordinate (sec: 0..300, cent: 1..99)
-    const sec = clamp(Math.floor((px / r.width) * 301), 0, 300);
-    const cent = clamp(99 - Math.floor((py / r.height) * 99), 1, 99);
-
-    const key = (sec * 100) + cent;
-    const cell = results.heat.get(key) ?? { wins: 0, total: 0 };
-    const wr01 = cell.total ? (cell.wins / cell.total) : null;
-
-    setHover({
-      sec, cent,
-      wins: cell.wins, total: cell.total,
-      winRate: wr01 != null ? +(wr01 * 100).toFixed(1) : null,
-      x: px, y: py
-    });
-  };
-
-  const onHeatLeave = () => setHover(null);
 
   return (
     <div className="space-y-6">
@@ -224,26 +223,36 @@ export default function BacktestEngine({ sessions }) {
             <label className="text-xs text-[var(--text2)] block mb-1">Buy Side</label>
             <div className="flex gap-2">
               {["UP","DOWN","BOTH"].map(s => (
-                <button key={s} onClick={() => setSide(s)}
+                <button
+                  key={s}
+                  onClick={() => setSide(s)}
                   className={`flex-1 py-2 rounded-lg font-bold text-sm transition ${
-                    side===s ? "bg-indigo-600 text-white" : "bg-[var(--bg2)] hover:bg-[var(--bg3)] text-[var(--text1)] border border-[var(--border)]"
-                  }`}>{s}</button>
+                    side===s
+                      ? "bg-indigo-600 text-white"
+                      : "bg-[var(--bg2)] hover:bg-[var(--bg3)] text-[var(--text1)] border border-[var(--border)]"
+                  }`}
+                >
+                  {s}
+                </button>
               ))}
             </div>
           </div>
 
           <div>
-            <label className="text-xs text-[var(--text2)] block mb-1">Chart View</label>
+            <label className="text-xs text-[var(--text2)] block mb-1">Output View</label>
             <div className="flex gap-2">
-              {[
-                ["priceRange","Entry Price (1c)"],
-                ["elapsedRange","Elapsed Time (1s)"],
-                ["priceTime","Price x Time (Heatmap)"],
-              ].map(([v,l]) => (
-                <button key={v} onClick={() => setGroupBy(v)}
+              {[["bestCombos","Best Price+Time"],["price","Entry Price (1c)"],["time","Elapsed Time (1s)"]].map(([v,l]) => (
+                <button
+                  key={v}
+                  onClick={() => setView(v)}
                   className={`flex-1 py-2 rounded-lg text-sm transition ${
-                    groupBy===v ? "bg-indigo-600 text-white" : "bg-[var(--bg2)] hover:bg-[var(--bg3)] text-[var(--text1)] border border-[var(--border)]"
-                  }`}>{l}</button>
+                    view===v
+                      ? "bg-indigo-600 text-white"
+                      : "bg-[var(--bg2)] hover:bg-[var(--bg3)] text-[var(--text1)] border border-[var(--border)]"
+                  }`}
+                >
+                  {l}
+                </button>
               ))}
             </div>
           </div>
@@ -259,7 +268,7 @@ export default function BacktestEngine({ sessions }) {
                 onChange={e => setPriceMax(+e.target.value)}
                 className="w-24 bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-1.5 text-sm text-[var(--text1)]" />
             </div>
-            <p className="text-xs text-[var(--text3)] mt-1">Tip: set 0.01-0.99 to show full domain</p>
+            <p className="text-xs text-[var(--text3)] mt-1">Default is 0.01-0.99 to show full domain</p>
           </div>
 
           <div>
@@ -273,6 +282,25 @@ export default function BacktestEngine({ sessions }) {
                 onChange={e => setElapsedMax(+e.target.value)}
                 className="w-24 bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-1.5 text-sm text-[var(--text1)]" />
             </div>
+          </div>
+
+          <div>
+            <label className="text-xs text-[var(--text2)] block mb-1">Top N combos (for Best Price+Time)</label>
+            <input
+              type="number" min="5" max="200" step="1" value={topN}
+              onChange={e => setTopN(+e.target.value)}
+              className="w-full bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-2 text-sm text-[var(--text1)]"
+            />
+          </div>
+
+          <div>
+            <label className="text-xs text-[var(--text2)] block mb-1">Min samples per combo (n)</label>
+            <input
+              type="number" min="1" step="1" value={minSamples}
+              onChange={e => setMinSamples(+e.target.value)}
+              className="w-full bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-2 text-sm text-[var(--text1)]"
+            />
+            <p className="text-xs text-[var(--text3)] mt-1">Increase this to avoid "lucky" 1-of-1 cells.</p>
           </div>
         </div>
 
@@ -296,13 +324,46 @@ export default function BacktestEngine({ sessions }) {
                 />
               </div>
 
-              {groupBy === "priceRange" && (
+              {view === "bestCombos" && (
+                <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-4 shadow-sm" style={{ height: 520 }}>
+                  <p className="text-xs text-[var(--text2)] mb-3">
+                    Best Price+Time combos (sorted highest to lowest win rate)
+                  </p>
+                  <ResponsiveContainer width="100%" height="92%">
+                    <BarChart data={results.bestCombos} layout="vertical" margin={{ left: 20, right: 20, top: 10, bottom: 10 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+                      <XAxis type="number" domain={[0, 100]} tickFormatter={(v) => `${v}%`} stroke="#94a3b8" tick={{ fontSize: 11 }} />
+                      <YAxis type="category" dataKey="label" width={120} stroke="#94a3b8" tick={{ fontSize: 11 }} />
+                      <Tooltip
+                        formatter={(v, n, ctx) => {
+                          const p = ctx?.payload;
+                          if (!p) return [v, n];
+                          return [`${p.winRate}% (wins=${p.wins}, n=${p.total})`, "Win Rate"];
+                        }}
+                        contentStyle={{ background:"var(--card)", border:"1px solid var(--border)", borderRadius:8 }}
+                      />
+                      <Bar dataKey="winRate" radius={[4,4,4,4]}>
+                        {results.bestCombos.map((e, i) => (
+                          <Cell key={i} fill={e.winRate >= 50 ? "#16a34a" : "#dc2626"} />
+                        ))}
+                      </Bar>
+                    </BarChart>
+                  </ResponsiveContainer>
+                  {results.bestCombos.length === 0 && (
+                    <p className="text-xs text-[var(--text3)] mt-3">
+                      No combos met min samples. Lower min samples (n) or widen your filters.
+                    </p>
+                  )}
+                </div>
+              )}
+
+              {view === "price" && (
                 <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-4 shadow-sm" style={{ height: 340 }}>
                   <p className="text-xs text-[var(--text2)] mb-3">Win Rate by Entry Price (1c increments)</p>
                   <ResponsiveContainer width="100%" height="90%">
                     <BarChart data={results.chartPrice}>
                       <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-                      <XAxis dataKey="cent" tickFormatter={(v) => `${v}c`} interval={0} angle={-60} textAnchor="end" height={80} stroke="#94a3b8" tick={{ fontSize: 10 }} />
+                      <XAxis dataKey="cent" tickFormatter={(v) => `${v}c`} interval={9} stroke="#94a3b8" tick={{ fontSize: 11 }} />
                       <YAxis domain={[0,100]} tickFormatter={(v) => `${v}%`} stroke="#94a3b8" tick={{ fontSize: 11 }} />
                       <Tooltip
                         formatter={(v, n, ctx) => {
@@ -323,7 +384,7 @@ export default function BacktestEngine({ sessions }) {
                 </div>
               )}
 
-              {groupBy === "elapsedRange" && (
+              {view === "time" && (
                 <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-4 shadow-sm" style={{ height: 340 }}>
                   <p className="text-xs text-[var(--text2)] mb-3">Win Rate by Elapsed Time (1s increments)</p>
                   <ResponsiveContainer width="100%" height="90%">
@@ -343,61 +404,6 @@ export default function BacktestEngine({ sessions }) {
                       <Line type="monotone" dataKey="winRate" stroke="#6366f1" dot={false} connectNulls={false} strokeWidth={2} />
                     </LineChart>
                   </ResponsiveContainer>
-                </div>
-              )}
-
-              {groupBy === "priceTime" && (
-                <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-4 shadow-sm">
-                  <p className="text-xs text-[var(--text2)] mb-2">Win Rate Heatmap (Price x Time)</p>
-                  <p className="text-xs text-[var(--text3)] mb-3">
-                    Hover anywhere on the heatmap to see: elapsed seconds, entry price (cents), win rate, and sample size.
-                  </p>
-
-                  <div
-                    ref={heatWrapRef}
-                    onMouseMove={onHeatMove}
-                    onMouseLeave={onHeatLeave}
-                    className="relative w-full border border-[var(--border)] rounded-lg overflow-hidden"
-                    style={{ height: 420 }}
-                  >
-                    {/* Render heat cells in an SVG, but use container mouse position for hover (reliable). */}
-                    <svg viewBox="0 0 301 99" preserveAspectRatio="none" width="100%" height="100%">
-                      <rect x="0" y="0" width="301" height="99" fill="rgba(148,163,184,0.08)" />
-                      {Array.from(results.heat.entries()).map(([key, v]) => {
-                        const sec = Math.floor(key / 100);
-                        const cent = key % 100;
-                        if (cent < 1 || cent > 99) return null;
-                        const wr01 = v.total ? (v.wins / v.total) : 0.5;
-                        const fill = colorForWinRate01(wr01);
-                        const y = (99 - cent);
-                        return <rect key={key} x={sec} y={y} width="1" height="1" fill={fill} opacity="0.95" />;
-                      })}
-                    </svg>
-
-                    {/* Hover tooltip */}
-                    {hover && (
-                      <div
-                        className="absolute pointer-events-none"
-                        style={{
-                          left: Math.min(Math.max(hover.x + 12, 8), (heatWrapRef.current?.clientWidth ?? 0) - 180),
-                          top: Math.min(Math.max(hover.y + 12, 8), (heatWrapRef.current?.clientHeight ?? 0) - 90),
-                          width: 180
-                        }}
-                      >
-                        <div className="rounded-lg border border-[var(--border)] bg-[var(--card)] shadow-lg px-3 py-2 text-xs text-[var(--text1)]">
-                          <div className="font-semibold mb-1">t={hover.sec}s, price={hover.cent}c</div>
-                          <div>Win rate: {hover.winRate != null ? `${hover.winRate}%` : "no data"}</div>
-                          <div>Samples: n={hover.total}, wins={hover.wins}</div>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-
-                  <div className="mt-3 text-xs text-[var(--text3)] flex items-center gap-3">
-                    <span>0%</span>
-                    <div className="flex-1 h-2 rounded" style={{ background: "linear-gradient(90deg, #dc2626, #eab308, #16a34a)" }} />
-                    <span>100%</span>
-                  </div>
                 </div>
               )}
             </>
@@ -422,22 +428,21 @@ function SCard({ label, value, color }) {
 }
 '@
 
-# Ensure our new engine file has no mojibake sequences either
 $engineNew = Fix-Mojibake $engineNew
 Backup-And-Write -Path $enginePath -NewText $engineNew
 
-# --- 2) Fix mojibake in tracker/backtest pages/components ---
-$otherFiles = @(
+# -------- Mojibake-fix pass on other UI files --------
+$other = @(
   "src\components\LiveTracker.js",
   "src\app\backtest\page.js",
   "src\app\page.js"
 ) | ForEach-Object { Join-Path $RepoRoot $_ }
 
-foreach ($p in $otherFiles) {
+foreach ($p in $other) {
   if (-not (Test-Path $p)) { continue }
-  $content = Get-Content -Path $p -Raw -Encoding UTF8
-  $fixed = Fix-Mojibake $content
-  if ($fixed -ne $content) {
+  $orig = Get-Content -Path $p -Raw -Encoding UTF8
+  $fixed = Fix-Mojibake $orig
+  if ($fixed -ne $orig) {
     Backup-And-Write -Path $p -NewText $fixed
   } elseif ($DryRun) {
     Write-Host "DRY RUN: No mojibake changes needed in $p"
