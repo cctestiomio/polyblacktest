@@ -175,9 +175,9 @@ export default function LiveTracker({ onSaveSession }) {
 
       // 3. Auto-Advance to Next Slug (next 5m bucket)
       const nextSlugTs = slugTs + 300;
-      setNextIn(5); // Show 5s countdown
+      setNextIn(1);
 
-      let count = 5;
+      let count = 1;
       cdRef.current = setInterval(() => {
         count--;
         setNextIn(count);
