@@ -1,28 +1,27 @@
-|,)\s*useEffect\s*(,|$)') { return $m.Value }
-        return 'import { ' + $inside.Trim() + ', useEffect } from "react";'
-      
+"use client";
+
+import { useState, useEffect, useCallback } from "react";
 import Link from "next/link";
 import BacktestEngine from "../../components/BacktestEngine";
 import ThemeToggle from "../../components/ThemeToggle";
 
 export default function BacktestPage() {
-    // PM_AUTOLOAD_BROWSER_BTN: auto-click "Load from this Browser" after 3s
+  // PM_AUTOLOAD_BROWSER_BTN: auto-click "Load from this Browser" after 3s
   useEffect(() => {
-    try {
-      if (typeof window !== "undefined") {
-        if (window.__pmAutoLoadBrowserRan) return;
-        window.__pmAutoLoadBrowserRan = true;
-      }
-    } catch {}
     const t = setTimeout(() => {
       try {
-        const btn = document.querySelector('button[data-auto-load="browser"]');
+        const btn = document.querySelector(
+          'button[data-auto-load="browser"], button:contains("Load from This Browser")'
+        );
         if (btn) btn.click();
-      } catch {}
+      } catch {
+        // ignore
+      }
     }, 3000);
     return () => clearTimeout(t);
   }, []);
-const [sessions, setSessions] = useState([]);
+
+  const [sessions, setSessions] = useState([]);
   const [dragOver, setDragOver] = useState(false);
 
   const processFiles = useCallback(async (files) => {
@@ -33,26 +32,34 @@ const [sessions, setSessions] = useState([]);
         const data = JSON.parse(text);
         const arr = Array.isArray(data) ? data : [data];
         loaded.push(...arr);
-      } catch (e) { alert(`Failed to parse ${file.name}: ${e.message}`); }
+      } catch (e) {
+        alert(`Failed to parse ${file.name}: ${e.message}`);
+      }
     }
-    setSessions(prev => {
+    setSessions((prev) => {
       const all = [...prev, ...loaded];
-      const map = new Map(all.map(s => [s.slug, s]));
+      const map = new Map(all.map((s) => [s.slug, s]));
       return [...map.values()];
     });
   }, []);
 
-  const onDrop = (e) => { e.preventDefault(); setDragOver(false); processFiles(e.dataTransfer.files); };
+  const onDrop = (e) => {
+    e.preventDefault();
+    setDragOver(false);
+    processFiles(e.dataTransfer.files);
+  };
 
   const loadFromBrowser = () => {
     try {
       const data = JSON.parse(localStorage.getItem("pm_sessions") ?? "[]");
-      setSessions(prev => {
+      setSessions((prev) => {
         const all = [...prev, ...data];
-        const map = new Map(all.map(s => [s.slug, s]));
+        const map = new Map(all.map((s) => [s.slug, s]));
         return [...map.values()];
       });
-    } catch { alert("No sessions in browser storage."); }
+    } catch {
+      alert("No sessions in browser storage.");
+    }
   };
 
   return (
@@ -61,8 +68,18 @@ const [sessions, setSessions] = useState([]);
         <div className="max-w-5xl mx-auto px-4 py-3 flex items-center gap-4">
           <span className="font-bold text-lg">⚡ PM BTC 5m</span>
           <div className="ml-auto flex gap-3 items-center">
-            <Link href="/" className="text-sm text-[var(--text2)] hover:text-[var(--text1)]">Live</Link>
-            <Link href="/backtest" className="text-sm font-semibold text-indigo-600 dark:text-indigo-400">Backtest</Link>
+            <Link
+              href="/"
+              className="text-sm text-[var(--text2)] hover:text-[var(--text1)]"
+            >
+              Live
+            </Link>
+            <Link
+              href="/backtest"
+              className="text-sm font-semibold text-indigo-600 dark:text-indigo-400"
+            >
+              Backtest
+            </Link>
             <ThemeToggle />
           </div>
         </div>
@@ -72,7 +89,10 @@ const [sessions, setSessions] = useState([]);
         <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-5 shadow-sm">
           <h1 className="text-lg font-bold mb-4">📂 Load Session Data</h1>
           <div
-            onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+            onDragOver={(e) => {
+              e.preventDefault();
+              setDragOver(true);
+            }}
             onDragLeave={() => setDragOver(false)}
             onDrop={onDrop}
             className={`border-2 border-dashed rounded-xl p-8 text-center transition ${
@@ -81,23 +101,43 @@ const [sessions, setSessions] = useState([]);
                 : "border-[var(--border)] hover:border-slate-400 dark:hover:border-slate-500"
             }`}
           >
-            <p className="text-[var(--text2)] mb-3">Drop JSON session files here, or</p>
+            <p className="text-[var(--text2)] mb-3">
+              Drop JSON session files here, or
+            </p>
             <label className="cursor-pointer px-5 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-sm font-semibold">
               Browse Files
-              <input type="file" accept=".json" multiple className="hidden" onChange={e => processFiles(e.target.files)} />
+              <input
+                type="file"
+                accept=".json"
+                multiple
+                className="hidden"
+                onChange={(e) => processFiles(e.target.files)}
+              />
             </label>
-            <p className="text-xs text-[var(--text3)] mt-3">One file can hold multiple sessions (array export)</p>
+            <p className="text-xs text-[var(--text3)] mt-3">
+              One file can hold multiple sessions (array export)
+            </p>
           </div>
 
           <div className="mt-3 flex gap-3 items-center flex-wrap">
-            <button onClick={loadFromBrowser}
-              className="px-4 py-2 bg-[var(--bg2)] hover:bg-[var(--bg3)] border border-[var(--border)] rounded-lg text-sm font-semibold">
+            <button
+              onClick={loadFromBrowser}
+              data-auto-load="browser"
+              className="px-4 py-2 bg-[var(--bg2)] hover:bg-[var(--bg3)] border border-[var(--border)] rounded-lg text-sm font-semibold"
+            >
               📥 Load from This Browser
             </button>
             {sessions.length > 0 && (
               <>
-                <span className="text-[var(--text2)] text-sm">{sessions.length} sessions loaded</span>
-                <button onClick={() => setSessions([])} className="ml-auto text-xs text-red-500 hover:text-red-600">Clear All</button>
+                <span className="text-[var(--text2)] text-sm">
+                  {sessions.length} sessions loaded
+                </span>
+                <button
+                  onClick={() => setSessions([])}
+                  className="ml-auto text-xs text-red-500 hover:text-red-600"
+                >
+                  Clear All
+                </button>
               </>
             )}
           </div>
@@ -105,13 +145,24 @@ const [sessions, setSessions] = useState([]);
           {sessions.length > 0 && (
             <div className="mt-3 grid grid-cols-1 sm:grid-cols-3 gap-2 max-h-40 overflow-y-auto">
               {sessions.map((s, i) => (
-                <div key={i} className="bg-[var(--bg2)] rounded-lg px-3 py-1.5 flex items-center gap-2 text-xs">
+                <div
+                  key={i}
+                  className="bg-[var(--bg2)] rounded-lg px-3 py-1.5 flex items-center gap-2 text-xs"
+                >
                   <span className="truncate flex-1 font-mono text-[var(--text3)]">
-                    {s.slug?.replace("btc-updown-5m-","") ?? "?"}
+                    {s.slug?.replace("btc-updown-5m-", "") ?? "?"}
                   </span>
-                  <span className="text-[var(--text3)]">{s.priceHistory?.length ?? 0}pts</span>
+                  <span className="text-[var(--text3)]">
+                    {s.priceHistory?.length ?? 0}pts
+                  </span>
                   {s.outcome && (
-                    <span className={`font-bold ${s.outcome==="UP"?"text-green-600 dark:text-green-400":"text-red-600 dark:text-red-400"}`}>
+                    <span
+                      className={`font-bold ${
+                        s.outcome === "UP"
+                          ? "text-green-600 dark:text-green-400"
+                          : "text-red-600 dark:text-red-400"
+                      }`}
+                    >
                       {s.outcome[0]}
                     </span>
                   )}
