@@ -45,30 +45,6 @@ export default function Home() {
     a.click();
   };
 
-const downloadSessionsSeparate = () => {
-  if (!sessions.length) return;
-
-  // One JSON file per session (browser may prompt; this is expected).
-  sessions.forEach((s, i) => {
-    const safeSlug = String(s.slug ?? `session_${i}`)
-      .replace(/[^a-zA-Z0-9._-]+/g, "_")
-      .slice(0, 180);
-
-    const ts = s.savedAt ?? Date.now();
-    const filename = `${safeSlug}_${ts}.json`;
-
-    const blob = new Blob([JSON.stringify(s, null, 2)], { type: "application/json" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = filename;
-
-    setTimeout(() => {
-      a.click();
-      setTimeout(() => URL.revokeObjectURL(a.href), 2000);
-    }, i * 200);
-  });
-};
-
   const clearSessions = () => {
     if (!confirm("Clear all saved sessions from this browser?")) return;
     setSessions([]);
@@ -109,7 +85,6 @@ const downloadSessionsSeparate = () => {
                 className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-lg text-sm font-semibold">
                 Download JSON
               </button>
-<button onClick={downloadSessionsSeparate} disabled={!sessions.length} className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-lg text-sm font-semibold">Download All JSON (separate)</button>
               <button onClick={clearSessions} disabled={!sessions.length}
                 className="px-4 py-1.5 bg-red-100 hover:bg-red-200 dark:bg-red-900/50 dark:hover:bg-red-900 disabled:opacity-40 text-red-700 dark:text-red-400 rounded-lg text-sm font-semibold">
                 Clear

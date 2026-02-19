@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 import { useEffect, useRef, useState, useCallback } from "react";
 import { LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid, ResponsiveContainer, ReferenceLine } from "recharts";
 import {
@@ -292,7 +292,7 @@ export default function LiveTracker({ onSaveSession }) {
           <div className="flex items-center gap-2">
             <p className="text-xs font-mono text-slate-400 dark:text-slate-500 truncate">{slugLabel || "Searching..."}</p>
             <span className="text-xs font-semibold">
-              {wsState === "connected" ? "WS" : wsState === "error" ? "WS ERR" : "WS"}
+              {wsState === "connected" ? "â— WS" : wsState === "error" ? "â— WS ERR" : "â—‹ WS"}
             </span>
           </div>
           <p className="text-sm text-slate-700 dark:text-slate-300 truncate">{question}</p>

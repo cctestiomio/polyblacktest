@@ -7,6 +7,11 @@ function clamp(n, lo, hi) {
   return Math.min(hi, Math.max(lo, x));
 }
 
+function fmtPrice01(p01) {
+  const p = clamp(p01, 0, 1);
+  return `$${p.toFixed(2)}`;
+}
+
 function fmtTime(sec) {
   const s = clamp(Math.round(sec), 0, 300);
   const m = Math.floor(s / 60);
@@ -14,29 +19,21 @@ function fmtTime(sec) {
   return `${m}m${r}s`;
 }
 
-function fmtPriceRange(centStart, centEnd) {
-  const a = (centStart / 100).toFixed(2);
-  const b = (centEnd / 100).toFixed(2);
-  return centStart === centEnd ? `$${a}` : `$${a}-$${b}`;
-}
-
 function opposite(side) {
   return side === "UP" ? "DOWN" : "UP";
 }
 
 export default function BacktestEngine({ sessions }) {
+  // Defaults requested
   const [buySide, setBuySide] = useState("BOTH"); // UP, DOWN, BOTH
   const [priceMin, setPriceMin] = useState(0.01);
   const [priceMax, setPriceMax] = useState(0.99);
   const [elapsedMin, setElapsedMin] = useState(0);
   const [elapsedMax, setElapsedMax] = useState(300);
 
-  // New: group by increments (and/or)
-  const [priceStepCents, setPriceStepCents] = useState(1); // 1 or 5
-  const [timeStepSecs, setTimeStepSecs] = useState(1);     // 1 or 5
-
+  // Make it easy to actually see rows
   const [topN, setTopN] = useState(50);
-  const [minSamples, setMinSamples] = useState(1);
+  const [minSamples, setMinSamples] = useState(1); // important: default low so table is not empty
 
   const [results, setResults] = useState(null);
 
@@ -45,26 +42,18 @@ export default function BacktestEngine({ sessions }) {
     const pMax = clamp(Math.max(priceMin, priceMax), 0, 1);
     const eMin = clamp(Math.min(elapsedMin, elapsedMax), 0, 300);
     const eMax = clamp(Math.max(elapsedMin, elapsedMax), 0, 300);
-
-    const ps = (Number(priceStepCents) === 5) ? 5 : 1;
-    const ts = (Number(timeStepSecs) === 5) ? 5 : 1;
-
     return {
       pMin, pMax, eMin, eMax,
-      ps, ts,
       topN: clamp(topN, 1, 500),
-      minSamples: clamp(minSamples, 1, 1000000),
+      minSamples: clamp(minSamples, 1, 1000000)
     };
-  }, [priceMin, priceMax, elapsedMin, elapsedMax, priceStepCents, timeStepSecs, topN, minSamples]);
+  }, [priceMin, priceMax, elapsedMin, elapsedMax, topN, minSamples]);
 
   const runBacktest = () => {
     const sides = buySide === "BOTH" ? ["UP", "DOWN"] : [buySide];
 
-    let tradesCount = 0;
-    let winsCount = 0;
-
-    // Key includes side + grouped buckets
-    const m = new Map(); // key = side|secStart|centStart
+    const trades = [];
+    const comboBySide = { UP: new Map(), DOWN: new Map() }; // key = sec*100 + cent
 
     for (const session of sessions) {
       const outcome = session?.outcome;
@@ -84,20 +73,12 @@ export default function BacktestEngine({ sessions }) {
           const cent = clamp(Math.round(price * 100), 0, 100);
           if (cent < 1 || cent > 99) continue;
 
-          // Grouping (and/or): if step is 1, buckets are exact; if 5, buckets are ranges.
-          const secStart = Math.floor(sec / normalized.ts) * normalized.ts;
-          const secEnd = Math.min(300, secStart + normalized.ts - 1);
-
-          const centStart = (Math.floor((cent - 1) / normalized.ps) * normalized.ps) + 1;
-          const centEnd = Math.min(99, centStart + normalized.ps - 1);
-
           const win = outcome === s;
+          trades.push({ sec, cent, side: s, win });
 
-          tradesCount++;
-          if (win) winsCount++;
-
-          const key = `${s}|${secStart}|${centStart}`;
-          const cur = m.get(key) ?? { side: s, secStart, secEnd, centStart, centEnd, wins: 0, total: 0 };
+          const key = (sec * 100) + cent;
+          const m = comboBySide[s];
+          const cur = m.get(key) ?? { wins: 0, total: 0, sec, cent, side: s };
           cur.total++;
           if (win) cur.wins++;
           m.set(key, cur);
@@ -105,32 +86,40 @@ export default function BacktestEngine({ sessions }) {
       }
     }
 
-    if (tradesCount === 0) {
-      setResults({ summary: null, rows: [], debug: { trades: 0, cells: 0 } });
+    if (!trades.length) {
+      setResults({ summary: null, bestCombos: [], debug: { combos: 0, trades: 0 } });
       return;
     }
 
-    const rows = [...m.values()]
+    const totalWins = trades.reduce((acc, t) => acc + (t.win ? 1 : 0), 0);
+    const overallWr = totalWins / trades.length;
+
+    const pool = [...comboBySide.UP.values(), ...comboBySide.DOWN.values()];
+
+    const bestCombos = pool
       .filter(x => x.total >= normalized.minSamples)
       .map(x => {
-        const wr01 = x.wins / x.total;
-        const wr = +(wr01 * 100).toFixed(1);
-        const likelyOutcome = (wr01 >= 0.5) ? x.side : opposite(x.side);
+        const winRate01 = x.wins / x.total;
+        const winRate = winRate01 * 100;
+        const price01 = x.cent / 100;
+        const likelyOutcome = (winRate01 >= 0.5) ? x.side : opposite(x.side);
         return {
-          ...x,
-          winRate: wr,
+          side: x.side,
+          price01,
+          sec: x.sec,
+          wins: x.wins,
+          total: x.total,
+          winRate: +winRate.toFixed(1),
           likelyOutcome,
-          priceLabel: fmtPriceRange(x.centStart, x.centEnd),
-          timeLabel: (x.secStart === x.secEnd) ? fmtTime(x.secStart) : `${fmtTime(x.secStart)}-${fmtTime(x.secEnd)}`
         };
       })
-      .sort((a, b) => (b.winRate - a.winRate) || (b.total - a.total) || (a.secStart - b.secStart) || (a.centStart - b.centStart))
+      .sort((a, b) => (b.winRate - a.winRate) || (b.total - a.total) || (a.sec - b.sec) || (a.price01 - b.price01))
       .slice(0, normalized.topN);
 
     setResults({
-      summary: { total: tradesCount, wins: winsCount, winRate: winsCount / tradesCount },
-      rows,
-      debug: { trades: tradesCount, cells: m.size, ps: normalized.ps, ts: normalized.ts }
+      summary: { total: trades.length, wins: totalWins, winRate: overallWr },
+      bestCombos,
+      debug: { combos: pool.length, trades: trades.length }
     });
   };
 
@@ -163,6 +152,7 @@ export default function BacktestEngine({ sessions }) {
                 onChange={e => setPriceMax(+e.target.value)}
                 className="w-24 bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-1.5 text-sm text-[var(--text1)]" />
             </div>
+            <p className="text-xs text-[var(--text3)] mt-1">Default is 0.01 to 0.99.</p>
           </div>
 
           <div>
@@ -179,24 +169,6 @@ export default function BacktestEngine({ sessions }) {
           </div>
 
           <div>
-            <label className="text-xs text-[var(--text2)] block mb-1">Group Price By</label>
-            <select value={priceStepCents} onChange={e => setPriceStepCents(+e.target.value)}
-              className="w-full bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-2 text-sm text-[var(--text1)]">
-              <option value={1}>1 cent</option>
-              <option value={5}>5 cents</option>
-            </select>
-          </div>
-
-          <div>
-            <label className="text-xs text-[var(--text2)] block mb-1">Group Time By</label>
-            <select value={timeStepSecs} onChange={e => setTimeStepSecs(+e.target.value)}
-              className="w-full bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-2 text-sm text-[var(--text1)]">
-              <option value={1}>1 second</option>
-              <option value={5}>5 seconds</option>
-            </select>
-          </div>
-
-          <div>
             <label className="text-xs text-[var(--text2)] block mb-1">Top N rows</label>
             <input type="number" min="1" max="500" step="1" value={topN}
               onChange={e => setTopN(+e.target.value)}
@@ -204,10 +176,11 @@ export default function BacktestEngine({ sessions }) {
           </div>
 
           <div>
-            <label className="text-xs text-[var(--text2)] block mb-1">Min samples per cell</label>
+            <label className="text-xs text-[var(--text2)] block mb-1">Min samples per (price,time) cell</label>
             <input type="number" min="1" step="1" value={minSamples}
               onChange={e => setMinSamples(+e.target.value)}
               className="w-full bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-2 text-sm text-[var(--text1)]" />
+            <p className="text-xs text-[var(--text3)] mt-1">If your table is empty, lower this.</p>
           </div>
         </div>
 
@@ -232,11 +205,11 @@ export default function BacktestEngine({ sessions }) {
               </div>
 
               <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-4 shadow-sm">
-                <p className="text-sm font-bold mb-2">Best price + time combos (sorted by win rate)</p>
+                <p className="text-sm font-bold mb-2">Best price + time combos (table, sorted by win rate)</p>
 
-                {results.rows.length === 0 ? (
+                {results.bestCombos.length === 0 ? (
                   <div className="text-sm text-[var(--text3)]">
-                    No rows. Lower Min samples, or widen filters, and confirm sessions have outcomes.
+                    No rows. Try: set Min samples to 1, widen filters, or confirm sessions have outcomes.
                   </div>
                 ) : (
                   <div className="overflow-x-auto">
@@ -253,11 +226,11 @@ export default function BacktestEngine({ sessions }) {
                         </tr>
                       </thead>
                       <tbody>
-                        {results.rows.map((r, i) => (
+                        {results.bestCombos.map((r, i) => (
                           <tr key={i} className="border-b border-[var(--border)] hover:bg-[var(--bg2)]">
                             <td className={`py-1 pr-4 font-bold ${r.side === "UP" ? "text-green-600" : "text-red-600"}`}>{r.side}</td>
-                            <td className="text-right pr-4">{r.priceLabel}</td>
-                            <td className="text-right pr-4">{r.timeLabel}</td>
+                            <td className="text-right pr-4">{fmtPrice01(r.price01)}</td>
+                            <td className="text-right pr-4">{fmtTime(r.sec)}</td>
                             <td className="text-right pr-4">{r.winRate}%</td>
                             <td className="text-right pr-4">{r.wins}</td>
                             <td className="text-right pr-4">{r.total}</td>
@@ -270,7 +243,7 @@ export default function BacktestEngine({ sessions }) {
                 )}
 
                 <div className="text-xs text-[var(--text3)] mt-3">
-                  Debug: trades={results.debug?.trades ?? 0}, cells={results.debug?.cells ?? 0}, priceStep={results.debug?.ps ?? "?"}c, timeStep={results.debug?.ts ?? "?"}s
+                  Debug: combos scanned={results.debug?.combos ?? 0}, trades={results.debug?.trades ?? 0}
                 </div>
               </div>
             </>
