@@ -16,13 +16,17 @@ GAMMA = "https://gamma-api.polymarket.com"
 CLOB  = "https://clob.polymarket.com"
 POLL  = 1
 
-def current_resolution_ts():
+def current_slug_ts():
+    """Return the START timestamp of the current 5-minute window (what Polymarket uses in slug)."""
     now = int(time.time())
-    adjusted = now + 1 if now % 300 == 0 else now
-    return math.ceil(adjusted / 300) * 300
+    return math.floor(now / 300) * 300  # floor = start of window
 
-def market_slug(ts):
-    return f"btc-updown-5m-{ts}"
+def resolution_ts(slug_ts):
+    """Market resolves 5 minutes after slug start."""
+    return slug_ts + 300
+
+def market_slug(slug_ts):
+    return f"btc-updown-5m-{slug_ts}"
 
 def valid_price(v):
     try:
@@ -84,8 +88,7 @@ def fetch_price(token_id):
     return None
 
 def poll_for_outcome(up_id, down_id, max_attempts=20, interval=3):
-    """After resolution, poll until one side settles >= 0.90. Returns 'UP', 'DOWN', or None."""
-    print(f"\n  Polling for settlement outcome (up to {max_attempts*interval}s)...", end="", flush=True)
+    print(f"\n  Polling for settlement (up to {max_attempts*interval}s)...", end="", flush=True)
     for i in range(max_attempts):
         if i > 0: time.sleep(interval)
         up_price   = fetch_price(up_id)
@@ -95,10 +98,10 @@ def poll_for_outcome(up_id, down_id, max_attempts=20, interval=3):
         if down_price is None and up_price is not None:
             down_price = round(1 - up_price, 6)
         if up_price and up_price >= 0.90:
-            print(f" -> UP ({up_price:.4f}) after {(i+1)*interval}s")
+            print(f" -> UP ({up_price:.4f})")
             return "UP"
         if down_price and down_price >= 0.90:
-            print(f" -> DOWN ({down_price:.4f}) after {(i+1)*interval}s")
+            print(f" -> DOWN ({down_price:.4f})")
             return "DOWN"
         print(".", end="", flush=True)
     print(" timed out")
@@ -123,39 +126,47 @@ def save_session(session_data, output_dir="."):
         json.dump(session_data, f, indent=2)
     return filename
 
-def track_market(slug, resolution_ts):
+def track_market(slug_ts):
+    slug   = market_slug(slug_ts)
+    res_ts = resolution_ts(slug_ts)
+
     print(f"\n{'='*60}")
-    print(f"  Market : {slug}")
-    print(f"  Resolves: epoch {resolution_ts}")
+    print(f"  Slug      : {slug}")
+    print(f"  Slug ts   : {slug_ts} (window start)")
+    print(f"  Resolves  : {res_ts} (window end / +300s)")
     print(f"{'='*60}")
+
     market = fetch_market(slug)
     if not market:
         print("  [SKIP] Market not found.")
         return None
+
     up_id   = market["up_id"]
     down_id = market["down_id"]
     print(f"  UP   token: {up_id}")
     print(f"  DOWN token: {down_id}\n")
     if not up_id:
-        print("  [ERROR] No UP token ID found.")
+        print("  [ERROR] No UP token ID.")
         return None
 
     session_data = {
-        "slug": slug, "resolutionTs": resolution_ts,
+        "slug": slug, "slugTs": slug_ts, "resolutionTs": res_ts,
         "question": market["question"], "outcome": None, "priceHistory": [],
     }
     last_save = time.time()
 
     while True:
         now       = int(time.time())
-        elapsed   = max(0, min(300, 300 - (resolution_ts - now)))
-        remaining = max(0, resolution_ts - now)
+        remaining = max(0, res_ts - now)
+        elapsed   = min(300, 300 - remaining)
+
         up_price   = fetch_price(up_id)
         down_price = fetch_price(down_id)
         if up_price is not None and down_price is None:
             down_price = round(1 - up_price, 6)
         if down_price is not None and up_price is None:
             up_price = round(1 - down_price, 6)
+
         point = {"t": now, "elapsed": elapsed, "up": up_price, "down": down_price}
         session_data["priceHistory"].append(point)
 
@@ -170,10 +181,8 @@ def track_market(slug, resolution_ts):
 
         if remaining <= 0:
             print()
-            # Poll for real settlement — do NOT guess from pre-resolution prices
             outcome = poll_for_outcome(up_id, down_id)
             if not outcome:
-                print("  Could not auto-detect. Market may use different resolution mechanism.")
                 ans = input("  Manual: u=UP / d=DOWN / Enter to skip: ").strip().lower()
                 if ans in ("u","up"):     outcome = "UP"
                 elif ans in ("d","down"): outcome = "DOWN"
@@ -184,15 +193,13 @@ def track_market(slug, resolution_ts):
         time.sleep(POLL)
 
     filename = save_session(session_data)
-    pts_with_price = sum(1 for p in session_data["priceHistory"] if p["up"] is not None)
-    print(f"  Saved: {filename}")
-    print(f"  Total: {len(session_data['priceHistory'])} pts | With price: {pts_with_price}")
+    pts_ok = sum(1 for p in session_data["priceHistory"] if p["up"] is not None)
+    print(f"  Saved: {filename}  ({len(session_data['priceHistory'])} pts, {pts_ok} priced)")
     return session_data
 
 def debug_market(slug):
     print(f"\nDEBUG: {GAMMA}/markets?slug={slug}")
     r = session.get(f"{GAMMA}/markets", params={"slug": slug}, timeout=8)
-    print(f"Status: {r.status_code}")
     print(json.dumps(r.json(), indent=2)[:3000])
 
 def main():
@@ -201,25 +208,35 @@ def main():
     parser.add_argument("--debug-slug")
     parser.add_argument("--slug")
     args = parser.parse_args()
+
     if args.debug_slug:
         debug_market(args.debug_slug); return
     if args.slug:
         ts_str = args.slug.replace("btc-updown-5m-","")
-        try: ts = int(ts_str)
-        except: print("Cannot parse timestamp"); return
-        track_market(args.slug, ts); return
+        try: slug_ts = int(ts_str)
+        except: print("Cannot parse timestamp from slug"); return
+        track_market(slug_ts); return
 
     print("Polymarket BTC 5m Tracker -- Ctrl+C to stop")
+    print(f"Output: {os.path.abspath('.')}\n")
+    print("NOTE: Slugs use window START time (floor). Resolution = slug_ts + 300.\n")
+
     while True:
-        ts   = current_resolution_ts()
-        slug = market_slug(ts)
-        now  = int(time.time())
-        if ts - now > 305:
-            wait = ts - now - 300
-            print(f"Waiting {wait}s for market to open: {slug}", end="\r")
-            time.sleep(5)
+        slug_ts = current_slug_ts()
+        slug    = market_slug(slug_ts)
+        res_ts  = resolution_ts(slug_ts)
+        now     = int(time.time())
+        remaining = max(0, res_ts - now)
+
+        if remaining <= 0:
+            # Window already ended, wait for next
+            next_slug_ts = slug_ts + 300
+            wait = next_slug_ts - now
+            print(f"Waiting {wait}s for next window: {market_slug(next_slug_ts)}", end="\r")
+            time.sleep(2)
             continue
-        track_market(slug, ts)
+
+        track_market(slug_ts)
         print("\nWaiting 3s...\n")
         time.sleep(3)
 

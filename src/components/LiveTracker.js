@@ -2,8 +2,8 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid, ResponsiveContainer, ReferenceLine } from "recharts";
 import {
-  getCurrentMarketTimestamp, getMarketSlug, fetchMarketBySlug,
-  fetchMidpoint, getSecondsElapsed, getSecondsRemaining,
+  getCurrentSlugTimestamp, getResolutionTs, getMarketSlug,
+  fetchMarketBySlug, fetchMidpoint, getSecondsElapsed, getSecondsRemaining,
   detectOutcome, resolveTokenIds, pollForOutcome,
 } from "../lib/polymarket";
 
@@ -21,22 +21,22 @@ export default function LiveTracker({ onSaveSession }) {
   const [remaining,    setRemaining]    = useState(300);
   const [curUp,        setCurUp]        = useState(null);
   const [curDown,      setCurDown]      = useState(null);
-  const [outcome,      setOutcome]      = useState(null);         // final confirmed outcome
-  const [outcomeConf,  setOutcomeConf]  = useState(false);        // high confidence?
-  const [resolving,    setResolving]    = useState(false);        // polling for outcome
+  const [outcome,      setOutcome]      = useState(null);
+  const [outcomeConf,  setOutcomeConf]  = useState(false);
+  const [resolving,    setResolving]    = useState(false);
   const [errorMsg,     setErrorMsg]     = useState("");
   const [nextIn,       setNextIn]       = useState(null);
   const [manualSlug,   setManualSlug]   = useState("");
   const [pricedPts,    setPricedPts]    = useState(0);
 
-  const intervalRef   = useRef(null);
-  const cdRef         = useRef(null);
-  const marketRef     = useRef(null);
-  const tokenRef      = useRef({ upId: null, downId: null });
-  const historyRef    = useRef([]);
-  const resolutionRef = useRef(null);
-  const savedRef      = useRef(false);
-  const startFnRef    = useRef(null);
+  const intervalRef  = useRef(null);
+  const cdRef        = useRef(null);
+  const marketRef    = useRef(null);
+  const tokenRef     = useRef({ upId: null, downId: null });
+  const historyRef   = useRef([]);
+  const slugTsRef    = useRef(null);   // START timestamp of the slug
+  const savedRef     = useRef(false);
+  const startFnRef   = useRef(null);
 
   const stopAll = useCallback(() => {
     clearInterval(intervalRef.current);
@@ -50,7 +50,8 @@ export default function LiveTracker({ onSaveSession }) {
     savedRef.current = true;
     onSaveSession({
       slug:         marketRef.current.slug,
-      resolutionTs: resolutionRef.current,
+      resolutionTs: getResolutionTs(slugTsRef.current),
+      slugTs:       slugTsRef.current,
       question:     marketRef.current.question,
       outcome:      det,
       priceHistory: history,
@@ -59,10 +60,11 @@ export default function LiveTracker({ onSaveSession }) {
   }, [onSaveSession]);
 
   const tick = useCallback(async () => {
-    const rts = resolutionRef.current;
-    if (!rts) return;
-    const el  = getSecondsElapsed(rts);
-    const rem = getSecondsRemaining(rts);
+    const slugTs = slugTsRef.current;
+    if (slugTs == null) return;
+
+    const el  = getSecondsElapsed(slugTs);
+    const rem = getSecondsRemaining(slugTs);
     setElapsed(el);
     setRemaining(rem);
 
@@ -94,46 +96,47 @@ export default function LiveTracker({ onSaveSession }) {
       clearInterval(intervalRef.current);
       intervalRef.current = null;
 
-      // ── Poll for real settled outcome (up to 60s, every 3s) ──────────────
       const { upId: uid, downId: did } = tokenRef.current;
       const snapshot = [...historyRef.current];
+      const capturedSlugTs = slugTs;
 
       pollForOutcome(uid, did, 20, 3000).then(polledOutcome => {
         setResolving(false);
         let finalOutcome = polledOutcome;
 
         if (!finalOutcome) {
-          // Fallback: look at the last 10 priced points and pick the dominant side
           const priced = snapshot.filter(p => p.up != null && p.down != null).slice(-10);
           if (priced.length > 0) {
             const avgUp = priced.reduce((s, p) => s + p.up, 0) / priced.length;
-            const { outcome: guessed } = detectOutcome(avgUp, 1 - avgUp);
-            finalOutcome = guessed;
+            finalOutcome = detectOutcome(avgUp, 1 - avgUp).outcome;
           }
         }
 
         setOutcome(finalOutcome);
-        setOutcomeConf(!!polledOutcome); // confident only if poll succeeded
+        setOutcomeConf(!!polledOutcome);
         doSave(snapshot, finalOutcome);
 
-        // Countdown to next market
-        const nextTs = (resolutionRef.current ?? 0) + 300;
+        // Next slug starts 300s after this slug's start
+        const nextSlugTs = capturedSlugTs + 300;
         cdRef.current = setInterval(() => {
-          const sec = nextTs - Math.floor(Date.now() / 1000);
-          if (sec <= 0) {
+          const sec = getSecondsRemaining(nextSlugTs) + 300 - 300;
+          // simpler: just count down to nextSlugTs start
+          const nowSec = Math.floor(Date.now() / 1000);
+          const secUntil = nextSlugTs - nowSec;
+          if (secUntil <= 0) {
             clearInterval(cdRef.current);
             cdRef.current = null;
             setNextIn(null);
-            if (startFnRef.current) startFnRef.current(getMarketSlug(nextTs), nextTs);
+            if (startFnRef.current) startFnRef.current(undefined, nextSlugTs);
           } else {
-            setNextIn(sec);
+            setNextIn(secUntil);
           }
         }, 500);
       });
     }
   }, [doSave]);
 
-  const startTracking = useCallback(async (slugOverride, rtsOverride) => {
+  const startTracking = useCallback(async (slugOverride, slugTsOverride) => {
     stopAll();
     setStatus("loading");
     setErrorMsg("");
@@ -148,9 +151,11 @@ export default function LiveTracker({ onSaveSession }) {
     setPricedPts(0);
     savedRef.current = false;
 
-    const rts  = rtsOverride ?? getCurrentMarketTimestamp();
-    const slug = slugOverride ?? getMarketSlug(rts);
-    resolutionRef.current = rts;
+    // Determine slug timestamp (START of window)
+    const slugTs = slugTsOverride ?? getCurrentSlugTimestamp();
+    slugTsRef.current = slugTs;
+
+    const slug = slugOverride ?? getMarketSlug(slugTs);
     setSlugLabel(slug);
     setQuestion("Loading...");
 
@@ -196,7 +201,6 @@ export default function LiveTracker({ onSaveSession }) {
   return (
     <div className="space-y-4">
 
-      {/* Header */}
       <div className="flex flex-wrap items-start gap-3">
         <div className="flex-1 min-w-0">
           <p className="text-xs font-mono text-slate-400 dark:text-slate-500 truncate">{slugLabel || "Searching..."}</p>
@@ -208,7 +212,6 @@ export default function LiveTracker({ onSaveSession }) {
         </div>
       </div>
 
-      {/* Manual slug */}
       <div className="flex gap-2">
         <input value={manualSlug} onChange={e => setManualSlug(e.target.value)}
           placeholder="btc-updown-5m-1771467600"
@@ -226,7 +229,6 @@ export default function LiveTracker({ onSaveSession }) {
 
       {errorMsg && <p className="text-red-500 dark:text-red-400 text-sm">{errorMsg}</p>}
 
-      {/* Token debug */}
       {tokenInfo && (
         <div className="bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg px-3 py-2 font-mono text-xs space-y-0.5">
           <div><span className="text-slate-400">UP&nbsp;&nbsp; </span><span className="text-green-600 dark:text-green-400">{tokenInfo.upId ?? "NOT FOUND"}</span></div>
@@ -235,7 +237,6 @@ export default function LiveTracker({ onSaveSession }) {
         </div>
       )}
 
-      {/* Stats */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         <StatCard label="UP Price"   value={curUp   != null ? `${(curUp*100).toFixed(1)}c`   : "---"} color="text-green-600 dark:text-green-400" />
         <StatCard label="DOWN Price" value={curDown != null ? `${(curDown*100).toFixed(1)}c` : "---"} color="text-red-600 dark:text-red-400" />
@@ -243,7 +244,6 @@ export default function LiveTracker({ onSaveSession }) {
         <StatCard label="Remaining"  value={fmtS(remaining)} color="text-orange-500 dark:text-orange-400" />
       </div>
 
-      {/* Resolved banner */}
       {status === "resolved" && (
         <div className={`rounded-xl p-4 text-center border ${
           resolving
@@ -256,38 +256,29 @@ export default function LiveTracker({ onSaveSession }) {
         }`}>
           {resolving ? (
             <div>
-              <p className="text-slate-500 dark:text-slate-400 font-semibold animate-pulse">
-                Waiting for settlement price...
-              </p>
+              <p className="text-slate-500 dark:text-slate-400 font-semibold animate-pulse">Waiting for settlement price...</p>
               <p className="text-xs text-slate-400 mt-1">Polling every 3s (up to 60s)</p>
             </div>
           ) : (
             <div>
               <p className={`font-bold text-lg ${outcome === "UP" ? "text-green-700 dark:text-green-300" : outcome === "DOWN" ? "text-red-700 dark:text-red-300" : "text-slate-600"}`}>
-                {outcome === "UP" ? "UP RESOLVED UP" : outcome === "DOWN" ? "DOWN RESOLVED DOWN" : "RESOLVED - unknown outcome"}
+                {outcome === "UP" ? "RESOLVED UP" : outcome === "DOWN" ? "RESOLVED DOWN" : "RESOLVED - unknown"}
               </p>
               {!outcomeConf && outcome && (
-                <p className="text-xs text-amber-600 dark:text-amber-400 mt-1">
-                  Low confidence - CLOB did not settle to 95c+ within 60s. Please verify on Polymarket.
-                </p>
+                <p className="text-xs text-amber-600 dark:text-amber-400 mt-1">Low confidence - verify on Polymarket and use override buttons below.</p>
               )}
-              {nextIn != null && (
-                <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">Next market in {fmtS(nextIn)}</p>
-              )}
+              {nextIn != null && <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">Next market in {fmtS(nextIn)}</p>}
             </div>
           )}
         </div>
       )}
 
-      {/* Chart */}
       <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4" style={{ height: 300 }}>
         {chartData.length === 0 ? (
           <div className="h-full flex flex-col items-center justify-center gap-2 text-slate-400 text-sm">
             <p>{status === "tracking" ? `Waiting for prices... (${priceHistory.length} pts polled)` : "No price data"}</p>
             {status === "tracking" && priceHistory.length > 10 && pricedPts === 0 && (
-              <p className="text-xs text-red-500 text-center max-w-sm">
-                All prices null. Check /api/debug?slug={slugLabel}
-              </p>
+              <p className="text-xs text-red-500 text-center max-w-sm">All prices null. Check /api/debug?slug={slugLabel}</p>
             )}
           </div>
         ) : (
@@ -309,7 +300,6 @@ export default function LiveTracker({ onSaveSession }) {
         )}
       </div>
 
-      {/* Save */}
       <div className="flex items-center justify-between">
         <p className="text-xs text-slate-400">{priceHistory.length} pts recorded - {pricedPts} with price data</p>
         <button

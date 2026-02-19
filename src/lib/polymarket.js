@@ -1,11 +1,28 @@
-export function getCurrentMarketTimestamp() {
+// Polymarket slugs use the START of the 5-minute window, NOT the resolution time.
+// e.g. market 9:25-9:30PM ET has slug btc-updown-5m-{9:25PM epoch}
+// Resolution happens at slugTimestamp + 300
+
+export function getCurrentSlugTimestamp() {
   const now = Math.floor(Date.now() / 1000);
-  const adjusted = (now % 300 === 0) ? now + 1 : now;
-  return Math.ceil(adjusted / 300) * 300;
+  return Math.floor(now / 300) * 300;  // START of current window
 }
-export function getMarketSlug(ts) { return `btc-updown-5m-${ts}`; }
-export function getSecondsRemaining(ts) { return Math.max(0, ts - Math.floor(Date.now() / 1000)); }
-export function getSecondsElapsed(ts)   { return Math.min(300, 300 - getSecondsRemaining(ts)); }
+
+export function getResolutionTs(slugTs) {
+  return slugTs + 300;  // market resolves 5 minutes after slug start
+}
+
+export function getMarketSlug(slugTs) {
+  return `btc-updown-5m-${slugTs}`;
+}
+
+export function getSecondsRemaining(slugTs) {
+  const resolutionTs = getResolutionTs(slugTs);
+  return Math.max(0, resolutionTs - Math.floor(Date.now() / 1000));
+}
+
+export function getSecondsElapsed(slugTs) {
+  return Math.min(300, 300 - getSecondsRemaining(slugTs));
+}
 
 export async function fetchMarketBySlug(slug) {
   try {
@@ -41,28 +58,14 @@ export function resolveTokenIds(market) {
   return { upId, downId };
 }
 
-/**
- * Detect outcome with confidence level.
- * Returns { outcome: "UP"|"DOWN"|null, confident: boolean }
- * 
- * "Confident" = one side is >= 0.90 (approaching resolution price).
- * If neither side is confident, outcome is a guess and should be flagged.
- */
 export function detectOutcome(up, down) {
-  const CONFIDENT_THRESHOLD = 0.90;
-  if (up   != null && up   >= CONFIDENT_THRESHOLD) return { outcome: "UP",   confident: true };
-  if (down != null && down >= CONFIDENT_THRESHOLD) return { outcome: "DOWN", confident: true };
-  // Low confidence — prices haven't settled yet (market resolved on-chain but CLOB not updated)
-  if (up != null && down != null) {
-    return { outcome: up > down ? "UP" : "DOWN", confident: false };
-  }
+  const T = 0.90;
+  if (up   != null && up   >= T) return { outcome: "UP",   confident: true };
+  if (down != null && down >= T) return { outcome: "DOWN", confident: true };
+  if (up   != null && down != null) return { outcome: up > down ? "UP" : "DOWN", confident: false };
   return { outcome: null, confident: false };
 }
 
-/**
- * Poll for resolved outcome — after resolution, retry until one side hits 0.90+
- * or until maxAttempts is reached. Returns "UP", "DOWN", or null.
- */
 export async function pollForOutcome(upId, downId, maxAttempts = 20, intervalMs = 3000) {
   for (let i = 0; i < maxAttempts; i++) {
     if (i > 0) await new Promise(r => setTimeout(r, intervalMs));
@@ -75,5 +78,5 @@ export async function pollForOutcome(upId, downId, maxAttempts = 20, intervalMs 
     const { outcome, confident } = detectOutcome(upP, downP);
     if (confident) return outcome;
   }
-  return null; // could not determine
+  return null;
 }

@@ -1,18 +1,34 @@
-# fix4.ps1 - Fix incorrect outcome detection
-# Run from inside polymarket-btc-backtest:  .\fix4.ps1
+# fix5.ps1 - Fix slug timing: use START timestamp not END timestamp
+# Run from inside polymarket-btc-backtest:  .\fix5.ps1
 
-Write-Host "Applying fix4 - outcome detection fixes..." -ForegroundColor Cyan
+Write-Host "Applying fix5 - slug timing fix..." -ForegroundColor Cyan
 
-# ── src/lib/polymarket.js ─────────────────────────────────────────────────────
 $lib = @'
-export function getCurrentMarketTimestamp() {
+// Polymarket slugs use the START of the 5-minute window, NOT the resolution time.
+// e.g. market 9:25-9:30PM ET has slug btc-updown-5m-{9:25PM epoch}
+// Resolution happens at slugTimestamp + 300
+
+export function getCurrentSlugTimestamp() {
   const now = Math.floor(Date.now() / 1000);
-  const adjusted = (now % 300 === 0) ? now + 1 : now;
-  return Math.ceil(adjusted / 300) * 300;
+  return Math.floor(now / 300) * 300;  // START of current window
 }
-export function getMarketSlug(ts) { return `btc-updown-5m-${ts}`; }
-export function getSecondsRemaining(ts) { return Math.max(0, ts - Math.floor(Date.now() / 1000)); }
-export function getSecondsElapsed(ts)   { return Math.min(300, 300 - getSecondsRemaining(ts)); }
+
+export function getResolutionTs(slugTs) {
+  return slugTs + 300;  // market resolves 5 minutes after slug start
+}
+
+export function getMarketSlug(slugTs) {
+  return `btc-updown-5m-${slugTs}`;
+}
+
+export function getSecondsRemaining(slugTs) {
+  const resolutionTs = getResolutionTs(slugTs);
+  return Math.max(0, resolutionTs - Math.floor(Date.now() / 1000));
+}
+
+export function getSecondsElapsed(slugTs) {
+  return Math.min(300, 300 - getSecondsRemaining(slugTs));
+}
 
 export async function fetchMarketBySlug(slug) {
   try {
@@ -48,28 +64,14 @@ export function resolveTokenIds(market) {
   return { upId, downId };
 }
 
-/**
- * Detect outcome with confidence level.
- * Returns { outcome: "UP"|"DOWN"|null, confident: boolean }
- * 
- * "Confident" = one side is >= 0.90 (approaching resolution price).
- * If neither side is confident, outcome is a guess and should be flagged.
- */
 export function detectOutcome(up, down) {
-  const CONFIDENT_THRESHOLD = 0.90;
-  if (up   != null && up   >= CONFIDENT_THRESHOLD) return { outcome: "UP",   confident: true };
-  if (down != null && down >= CONFIDENT_THRESHOLD) return { outcome: "DOWN", confident: true };
-  // Low confidence — prices haven't settled yet (market resolved on-chain but CLOB not updated)
-  if (up != null && down != null) {
-    return { outcome: up > down ? "UP" : "DOWN", confident: false };
-  }
+  const T = 0.90;
+  if (up   != null && up   >= T) return { outcome: "UP",   confident: true };
+  if (down != null && down >= T) return { outcome: "DOWN", confident: true };
+  if (up   != null && down != null) return { outcome: up > down ? "UP" : "DOWN", confident: false };
   return { outcome: null, confident: false };
 }
 
-/**
- * Poll for resolved outcome — after resolution, retry until one side hits 0.90+
- * or until maxAttempts is reached. Returns "UP", "DOWN", or null.
- */
 export async function pollForOutcome(upId, downId, maxAttempts = 20, intervalMs = 3000) {
   for (let i = 0; i < maxAttempts; i++) {
     if (i > 0) await new Promise(r => setTimeout(r, intervalMs));
@@ -82,19 +84,18 @@ export async function pollForOutcome(upId, downId, maxAttempts = 20, intervalMs 
     const { outcome, confident } = detectOutcome(upP, downP);
     if (confident) return outcome;
   }
-  return null; // could not determine
+  return null;
 }
 '@
 Set-Content "src/lib/polymarket.js" -Value $lib
 
-# ── src/components/LiveTracker.js ─────────────────────────────────────────────
 $tracker = @'
 "use client";
 import { useEffect, useRef, useState, useCallback } from "react";
 import { LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid, ResponsiveContainer, ReferenceLine } from "recharts";
 import {
-  getCurrentMarketTimestamp, getMarketSlug, fetchMarketBySlug,
-  fetchMidpoint, getSecondsElapsed, getSecondsRemaining,
+  getCurrentSlugTimestamp, getResolutionTs, getMarketSlug,
+  fetchMarketBySlug, fetchMidpoint, getSecondsElapsed, getSecondsRemaining,
   detectOutcome, resolveTokenIds, pollForOutcome,
 } from "../lib/polymarket";
 
@@ -112,22 +113,22 @@ export default function LiveTracker({ onSaveSession }) {
   const [remaining,    setRemaining]    = useState(300);
   const [curUp,        setCurUp]        = useState(null);
   const [curDown,      setCurDown]      = useState(null);
-  const [outcome,      setOutcome]      = useState(null);         // final confirmed outcome
-  const [outcomeConf,  setOutcomeConf]  = useState(false);        // high confidence?
-  const [resolving,    setResolving]    = useState(false);        // polling for outcome
+  const [outcome,      setOutcome]      = useState(null);
+  const [outcomeConf,  setOutcomeConf]  = useState(false);
+  const [resolving,    setResolving]    = useState(false);
   const [errorMsg,     setErrorMsg]     = useState("");
   const [nextIn,       setNextIn]       = useState(null);
   const [manualSlug,   setManualSlug]   = useState("");
   const [pricedPts,    setPricedPts]    = useState(0);
 
-  const intervalRef   = useRef(null);
-  const cdRef         = useRef(null);
-  const marketRef     = useRef(null);
-  const tokenRef      = useRef({ upId: null, downId: null });
-  const historyRef    = useRef([]);
-  const resolutionRef = useRef(null);
-  const savedRef      = useRef(false);
-  const startFnRef    = useRef(null);
+  const intervalRef  = useRef(null);
+  const cdRef        = useRef(null);
+  const marketRef    = useRef(null);
+  const tokenRef     = useRef({ upId: null, downId: null });
+  const historyRef   = useRef([]);
+  const slugTsRef    = useRef(null);   // START timestamp of the slug
+  const savedRef     = useRef(false);
+  const startFnRef   = useRef(null);
 
   const stopAll = useCallback(() => {
     clearInterval(intervalRef.current);
@@ -141,7 +142,8 @@ export default function LiveTracker({ onSaveSession }) {
     savedRef.current = true;
     onSaveSession({
       slug:         marketRef.current.slug,
-      resolutionTs: resolutionRef.current,
+      resolutionTs: getResolutionTs(slugTsRef.current),
+      slugTs:       slugTsRef.current,
       question:     marketRef.current.question,
       outcome:      det,
       priceHistory: history,
@@ -150,10 +152,11 @@ export default function LiveTracker({ onSaveSession }) {
   }, [onSaveSession]);
 
   const tick = useCallback(async () => {
-    const rts = resolutionRef.current;
-    if (!rts) return;
-    const el  = getSecondsElapsed(rts);
-    const rem = getSecondsRemaining(rts);
+    const slugTs = slugTsRef.current;
+    if (slugTs == null) return;
+
+    const el  = getSecondsElapsed(slugTs);
+    const rem = getSecondsRemaining(slugTs);
     setElapsed(el);
     setRemaining(rem);
 
@@ -185,46 +188,47 @@ export default function LiveTracker({ onSaveSession }) {
       clearInterval(intervalRef.current);
       intervalRef.current = null;
 
-      // ── Poll for real settled outcome (up to 60s, every 3s) ──────────────
       const { upId: uid, downId: did } = tokenRef.current;
       const snapshot = [...historyRef.current];
+      const capturedSlugTs = slugTs;
 
       pollForOutcome(uid, did, 20, 3000).then(polledOutcome => {
         setResolving(false);
         let finalOutcome = polledOutcome;
 
         if (!finalOutcome) {
-          // Fallback: look at the last 10 priced points and pick the dominant side
           const priced = snapshot.filter(p => p.up != null && p.down != null).slice(-10);
           if (priced.length > 0) {
             const avgUp = priced.reduce((s, p) => s + p.up, 0) / priced.length;
-            const { outcome: guessed } = detectOutcome(avgUp, 1 - avgUp);
-            finalOutcome = guessed;
+            finalOutcome = detectOutcome(avgUp, 1 - avgUp).outcome;
           }
         }
 
         setOutcome(finalOutcome);
-        setOutcomeConf(!!polledOutcome); // confident only if poll succeeded
+        setOutcomeConf(!!polledOutcome);
         doSave(snapshot, finalOutcome);
 
-        // Countdown to next market
-        const nextTs = (resolutionRef.current ?? 0) + 300;
+        // Next slug starts 300s after this slug's start
+        const nextSlugTs = capturedSlugTs + 300;
         cdRef.current = setInterval(() => {
-          const sec = nextTs - Math.floor(Date.now() / 1000);
-          if (sec <= 0) {
+          const sec = getSecondsRemaining(nextSlugTs) + 300 - 300;
+          // simpler: just count down to nextSlugTs start
+          const nowSec = Math.floor(Date.now() / 1000);
+          const secUntil = nextSlugTs - nowSec;
+          if (secUntil <= 0) {
             clearInterval(cdRef.current);
             cdRef.current = null;
             setNextIn(null);
-            if (startFnRef.current) startFnRef.current(getMarketSlug(nextTs), nextTs);
+            if (startFnRef.current) startFnRef.current(undefined, nextSlugTs);
           } else {
-            setNextIn(sec);
+            setNextIn(secUntil);
           }
         }, 500);
       });
     }
   }, [doSave]);
 
-  const startTracking = useCallback(async (slugOverride, rtsOverride) => {
+  const startTracking = useCallback(async (slugOverride, slugTsOverride) => {
     stopAll();
     setStatus("loading");
     setErrorMsg("");
@@ -239,9 +243,11 @@ export default function LiveTracker({ onSaveSession }) {
     setPricedPts(0);
     savedRef.current = false;
 
-    const rts  = rtsOverride ?? getCurrentMarketTimestamp();
-    const slug = slugOverride ?? getMarketSlug(rts);
-    resolutionRef.current = rts;
+    // Determine slug timestamp (START of window)
+    const slugTs = slugTsOverride ?? getCurrentSlugTimestamp();
+    slugTsRef.current = slugTs;
+
+    const slug = slugOverride ?? getMarketSlug(slugTs);
     setSlugLabel(slug);
     setQuestion("Loading...");
 
@@ -287,7 +293,6 @@ export default function LiveTracker({ onSaveSession }) {
   return (
     <div className="space-y-4">
 
-      {/* Header */}
       <div className="flex flex-wrap items-start gap-3">
         <div className="flex-1 min-w-0">
           <p className="text-xs font-mono text-slate-400 dark:text-slate-500 truncate">{slugLabel || "Searching..."}</p>
@@ -299,7 +304,6 @@ export default function LiveTracker({ onSaveSession }) {
         </div>
       </div>
 
-      {/* Manual slug */}
       <div className="flex gap-2">
         <input value={manualSlug} onChange={e => setManualSlug(e.target.value)}
           placeholder="btc-updown-5m-1771467600"
@@ -317,7 +321,6 @@ export default function LiveTracker({ onSaveSession }) {
 
       {errorMsg && <p className="text-red-500 dark:text-red-400 text-sm">{errorMsg}</p>}
 
-      {/* Token debug */}
       {tokenInfo && (
         <div className="bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg px-3 py-2 font-mono text-xs space-y-0.5">
           <div><span className="text-slate-400">UP&nbsp;&nbsp; </span><span className="text-green-600 dark:text-green-400">{tokenInfo.upId ?? "NOT FOUND"}</span></div>
@@ -326,7 +329,6 @@ export default function LiveTracker({ onSaveSession }) {
         </div>
       )}
 
-      {/* Stats */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         <StatCard label="UP Price"   value={curUp   != null ? `${(curUp*100).toFixed(1)}c`   : "---"} color="text-green-600 dark:text-green-400" />
         <StatCard label="DOWN Price" value={curDown != null ? `${(curDown*100).toFixed(1)}c` : "---"} color="text-red-600 dark:text-red-400" />
@@ -334,7 +336,6 @@ export default function LiveTracker({ onSaveSession }) {
         <StatCard label="Remaining"  value={fmtS(remaining)} color="text-orange-500 dark:text-orange-400" />
       </div>
 
-      {/* Resolved banner */}
       {status === "resolved" && (
         <div className={`rounded-xl p-4 text-center border ${
           resolving
@@ -347,38 +348,29 @@ export default function LiveTracker({ onSaveSession }) {
         }`}>
           {resolving ? (
             <div>
-              <p className="text-slate-500 dark:text-slate-400 font-semibold animate-pulse">
-                Waiting for settlement price...
-              </p>
+              <p className="text-slate-500 dark:text-slate-400 font-semibold animate-pulse">Waiting for settlement price...</p>
               <p className="text-xs text-slate-400 mt-1">Polling every 3s (up to 60s)</p>
             </div>
           ) : (
             <div>
               <p className={`font-bold text-lg ${outcome === "UP" ? "text-green-700 dark:text-green-300" : outcome === "DOWN" ? "text-red-700 dark:text-red-300" : "text-slate-600"}`}>
-                {outcome === "UP" ? "UP RESOLVED UP" : outcome === "DOWN" ? "DOWN RESOLVED DOWN" : "RESOLVED - unknown outcome"}
+                {outcome === "UP" ? "RESOLVED UP" : outcome === "DOWN" ? "RESOLVED DOWN" : "RESOLVED - unknown"}
               </p>
               {!outcomeConf && outcome && (
-                <p className="text-xs text-amber-600 dark:text-amber-400 mt-1">
-                  Low confidence - CLOB did not settle to 95c+ within 60s. Please verify on Polymarket.
-                </p>
+                <p className="text-xs text-amber-600 dark:text-amber-400 mt-1">Low confidence - verify on Polymarket and use override buttons below.</p>
               )}
-              {nextIn != null && (
-                <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">Next market in {fmtS(nextIn)}</p>
-              )}
+              {nextIn != null && <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">Next market in {fmtS(nextIn)}</p>}
             </div>
           )}
         </div>
       )}
 
-      {/* Chart */}
       <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4" style={{ height: 300 }}>
         {chartData.length === 0 ? (
           <div className="h-full flex flex-col items-center justify-center gap-2 text-slate-400 text-sm">
             <p>{status === "tracking" ? `Waiting for prices... (${priceHistory.length} pts polled)` : "No price data"}</p>
             {status === "tracking" && priceHistory.length > 10 && pricedPts === 0 && (
-              <p className="text-xs text-red-500 text-center max-w-sm">
-                All prices null. Check /api/debug?slug={slugLabel}
-              </p>
+              <p className="text-xs text-red-500 text-center max-w-sm">All prices null. Check /api/debug?slug={slugLabel}</p>
             )}
           </div>
         ) : (
@@ -400,7 +392,6 @@ export default function LiveTracker({ onSaveSession }) {
         )}
       </div>
 
-      {/* Save */}
       <div className="flex items-center justify-between">
         <p className="text-xs text-slate-400">{priceHistory.length} pts recorded - {pricedPts} with price data</p>
         <button
@@ -425,148 +416,7 @@ function StatCard({ label, value, color }) {
 '@
 Set-Content "src/components/LiveTracker.js" -Value $tracker
 
-# ── src/app/page.js — add manual outcome override on saved sessions ───────────
-$page = @'
-"use client";
-import { useState, useCallback } from "react";
-import Link from "next/link";
-import LiveTracker from "../components/LiveTracker";
-import ThemeToggle from "../components/ThemeToggle";
-
-const STORAGE_KEY = "pm_sessions";
-function loadSessions() {
-  if (typeof window === "undefined") return [];
-  try { return JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "[]"); } catch { return []; }
-}
-function saveSessions(sessions) { localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions)); }
-
-export default function Home() {
-  const [sessions, setSessions] = useState(() => loadSessions());
-  const [toastMsg, setToastMsg] = useState(null);
-
-  const showToast = (msg) => { setToastMsg(msg); setTimeout(() => setToastMsg(null), 3000); };
-
-  const onSaveSession = useCallback((session) => {
-    setSessions(prev => {
-      const next = [...prev.filter(s => s.slug !== session.slug), session];
-      saveSessions(next);
-      return next;
-    });
-    showToast(`Saved: ${session.slug} - Outcome: ${session.outcome ?? "unknown"}`);
-  }, []);
-
-  // Manual outcome override for any saved session
-  const overrideOutcome = useCallback((slug, outcome) => {
-    setSessions(prev => {
-      const next = prev.map(s => s.slug === slug ? { ...s, outcome } : s);
-      saveSessions(next);
-      return next;
-    });
-    showToast(`Updated ${slug.replace("btc-updown-5m-","")} -> ${outcome}`);
-  }, []);
-
-  const downloadSessions = () => {
-    if (!sessions.length) return;
-    const blob = new Blob([JSON.stringify(sessions, null, 2)], { type: "application/json" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = `pm_btc5m_${Date.now()}.json`;
-    a.click();
-  };
-
-  const clearSessions = () => {
-    if (!confirm("Clear all saved sessions from this browser?")) return;
-    setSessions([]);
-    localStorage.removeItem(STORAGE_KEY);
-  };
-
-  return (
-    <div className="min-h-screen bg-[var(--bg)] text-[var(--text1)]">
-      {toastMsg && (
-        <div className="fixed top-4 right-4 z-50 bg-indigo-600 text-white text-sm font-medium px-4 py-3 rounded-xl shadow-lg max-w-sm">
-          {toastMsg}
-        </div>
-      )}
-
-      <nav className="border-b border-[var(--border)] bg-[var(--nav)] backdrop-blur sticky top-0 z-10">
-        <div className="max-w-5xl mx-auto px-4 py-3 flex items-center gap-4">
-          <span className="font-bold text-lg">PM BTC 5m</span>
-          <span className="text-[var(--text2)] text-sm hidden sm:block">Polymarket Tracker & Backtest</span>
-          <div className="ml-auto flex gap-3 items-center">
-            <Link href="/"         className="text-sm font-semibold text-indigo-600 dark:text-indigo-400">Live</Link>
-            <Link href="/backtest" className="text-sm text-[var(--text2)] hover:text-[var(--text1)]">Backtest</Link>
-            <ThemeToggle />
-          </div>
-        </div>
-      </nav>
-
-      <main className="max-w-5xl mx-auto px-4 py-6 space-y-6">
-        <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-5 shadow-sm">
-          <h1 className="text-lg font-bold mb-4">Live Tracker</h1>
-          <LiveTracker onSaveSession={onSaveSession} />
-        </div>
-
-        <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-5 shadow-sm">
-          <div className="flex items-center gap-3 mb-4">
-            <h2 className="text-lg font-bold">Saved Sessions ({sessions.length})</h2>
-            <div className="ml-auto flex gap-2">
-              <button onClick={downloadSessions} disabled={!sessions.length}
-                className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-lg text-sm font-semibold">
-                Download JSON
-              </button>
-              <button onClick={clearSessions} disabled={!sessions.length}
-                className="px-4 py-1.5 bg-red-100 hover:bg-red-200 dark:bg-red-900/50 dark:hover:bg-red-900 disabled:opacity-40 text-red-700 dark:text-red-400 rounded-lg text-sm font-semibold">
-                Clear
-              </button>
-            </div>
-          </div>
-
-          {!sessions.length ? (
-            <p className="text-[var(--text3)] text-sm">No sessions yet. Markets auto-save on resolution.</p>
-          ) : (
-            <div className="space-y-2 max-h-96 overflow-y-auto">
-              {[...sessions].reverse().map((s, i) => (
-                <div key={i} className="flex items-center gap-3 bg-[var(--bg2)] rounded-lg px-3 py-2">
-                  <span className="font-mono text-xs text-[var(--text3)] truncate flex-1">{s.slug}</span>
-                  <span className="text-xs text-[var(--text3)] shrink-0">{s.priceHistory?.length ?? 0} pts</span>
-
-                  {/* Manual outcome override buttons */}
-                  <div className="flex gap-1 shrink-0">
-                    <button
-                      onClick={() => overrideOutcome(s.slug, "UP")}
-                      className={`px-2 py-0.5 rounded text-xs font-bold border transition ${
-                        s.outcome === "UP"
-                          ? "bg-green-500 text-white border-green-500"
-                          : "bg-transparent border-green-400 text-green-600 dark:text-green-400 hover:bg-green-50 dark:hover:bg-green-900/30"
-                      }`}
-                    >UP</button>
-                    <button
-                      onClick={() => overrideOutcome(s.slug, "DOWN")}
-                      className={`px-2 py-0.5 rounded text-xs font-bold border transition ${
-                        s.outcome === "DOWN"
-                          ? "bg-red-500 text-white border-red-500"
-                          : "bg-transparent border-red-400 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/30"
-                      }`}
-                    >DOWN</button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-          {sessions.length > 0 && (
-            <p className="text-xs text-[var(--text3)] mt-3">
-              Click UP / DOWN on any row to correct its outcome before running a backtest.
-            </p>
-          )}
-        </div>
-      </main>
-    </div>
-  );
-}
-'@
-Set-Content "src/app/page.js" -Value $page
-
-# ── tracker.py — poll for settlement after resolution ────────────────────────
+# Fix tracker.py: use floor for slug timestamp, resolution = slug_ts + 300
 $trackerPy = @'
 import json, math, time, os, sys
 
@@ -586,13 +436,17 @@ GAMMA = "https://gamma-api.polymarket.com"
 CLOB  = "https://clob.polymarket.com"
 POLL  = 1
 
-def current_resolution_ts():
+def current_slug_ts():
+    """Return the START timestamp of the current 5-minute window (what Polymarket uses in slug)."""
     now = int(time.time())
-    adjusted = now + 1 if now % 300 == 0 else now
-    return math.ceil(adjusted / 300) * 300
+    return math.floor(now / 300) * 300  # floor = start of window
 
-def market_slug(ts):
-    return f"btc-updown-5m-{ts}"
+def resolution_ts(slug_ts):
+    """Market resolves 5 minutes after slug start."""
+    return slug_ts + 300
+
+def market_slug(slug_ts):
+    return f"btc-updown-5m-{slug_ts}"
 
 def valid_price(v):
     try:
@@ -654,8 +508,7 @@ def fetch_price(token_id):
     return None
 
 def poll_for_outcome(up_id, down_id, max_attempts=20, interval=3):
-    """After resolution, poll until one side settles >= 0.90. Returns 'UP', 'DOWN', or None."""
-    print(f"\n  Polling for settlement outcome (up to {max_attempts*interval}s)...", end="", flush=True)
+    print(f"\n  Polling for settlement (up to {max_attempts*interval}s)...", end="", flush=True)
     for i in range(max_attempts):
         if i > 0: time.sleep(interval)
         up_price   = fetch_price(up_id)
@@ -665,10 +518,10 @@ def poll_for_outcome(up_id, down_id, max_attempts=20, interval=3):
         if down_price is None and up_price is not None:
             down_price = round(1 - up_price, 6)
         if up_price and up_price >= 0.90:
-            print(f" -> UP ({up_price:.4f}) after {(i+1)*interval}s")
+            print(f" -> UP ({up_price:.4f})")
             return "UP"
         if down_price and down_price >= 0.90:
-            print(f" -> DOWN ({down_price:.4f}) after {(i+1)*interval}s")
+            print(f" -> DOWN ({down_price:.4f})")
             return "DOWN"
         print(".", end="", flush=True)
     print(" timed out")
@@ -693,39 +546,47 @@ def save_session(session_data, output_dir="."):
         json.dump(session_data, f, indent=2)
     return filename
 
-def track_market(slug, resolution_ts):
+def track_market(slug_ts):
+    slug   = market_slug(slug_ts)
+    res_ts = resolution_ts(slug_ts)
+
     print(f"\n{'='*60}")
-    print(f"  Market : {slug}")
-    print(f"  Resolves: epoch {resolution_ts}")
+    print(f"  Slug      : {slug}")
+    print(f"  Slug ts   : {slug_ts} (window start)")
+    print(f"  Resolves  : {res_ts} (window end / +300s)")
     print(f"{'='*60}")
+
     market = fetch_market(slug)
     if not market:
         print("  [SKIP] Market not found.")
         return None
+
     up_id   = market["up_id"]
     down_id = market["down_id"]
     print(f"  UP   token: {up_id}")
     print(f"  DOWN token: {down_id}\n")
     if not up_id:
-        print("  [ERROR] No UP token ID found.")
+        print("  [ERROR] No UP token ID.")
         return None
 
     session_data = {
-        "slug": slug, "resolutionTs": resolution_ts,
+        "slug": slug, "slugTs": slug_ts, "resolutionTs": res_ts,
         "question": market["question"], "outcome": None, "priceHistory": [],
     }
     last_save = time.time()
 
     while True:
         now       = int(time.time())
-        elapsed   = max(0, min(300, 300 - (resolution_ts - now)))
-        remaining = max(0, resolution_ts - now)
+        remaining = max(0, res_ts - now)
+        elapsed   = min(300, 300 - remaining)
+
         up_price   = fetch_price(up_id)
         down_price = fetch_price(down_id)
         if up_price is not None and down_price is None:
             down_price = round(1 - up_price, 6)
         if down_price is not None and up_price is None:
             up_price = round(1 - down_price, 6)
+
         point = {"t": now, "elapsed": elapsed, "up": up_price, "down": down_price}
         session_data["priceHistory"].append(point)
 
@@ -740,10 +601,8 @@ def track_market(slug, resolution_ts):
 
         if remaining <= 0:
             print()
-            # Poll for real settlement — do NOT guess from pre-resolution prices
             outcome = poll_for_outcome(up_id, down_id)
             if not outcome:
-                print("  Could not auto-detect. Market may use different resolution mechanism.")
                 ans = input("  Manual: u=UP / d=DOWN / Enter to skip: ").strip().lower()
                 if ans in ("u","up"):     outcome = "UP"
                 elif ans in ("d","down"): outcome = "DOWN"
@@ -754,15 +613,13 @@ def track_market(slug, resolution_ts):
         time.sleep(POLL)
 
     filename = save_session(session_data)
-    pts_with_price = sum(1 for p in session_data["priceHistory"] if p["up"] is not None)
-    print(f"  Saved: {filename}")
-    print(f"  Total: {len(session_data['priceHistory'])} pts | With price: {pts_with_price}")
+    pts_ok = sum(1 for p in session_data["priceHistory"] if p["up"] is not None)
+    print(f"  Saved: {filename}  ({len(session_data['priceHistory'])} pts, {pts_ok} priced)")
     return session_data
 
 def debug_market(slug):
     print(f"\nDEBUG: {GAMMA}/markets?slug={slug}")
     r = session.get(f"{GAMMA}/markets", params={"slug": slug}, timeout=8)
-    print(f"Status: {r.status_code}")
     print(json.dumps(r.json(), indent=2)[:3000])
 
 def main():
@@ -771,25 +628,35 @@ def main():
     parser.add_argument("--debug-slug")
     parser.add_argument("--slug")
     args = parser.parse_args()
+
     if args.debug_slug:
         debug_market(args.debug_slug); return
     if args.slug:
         ts_str = args.slug.replace("btc-updown-5m-","")
-        try: ts = int(ts_str)
-        except: print("Cannot parse timestamp"); return
-        track_market(args.slug, ts); return
+        try: slug_ts = int(ts_str)
+        except: print("Cannot parse timestamp from slug"); return
+        track_market(slug_ts); return
 
     print("Polymarket BTC 5m Tracker -- Ctrl+C to stop")
+    print(f"Output: {os.path.abspath('.')}\n")
+    print("NOTE: Slugs use window START time (floor). Resolution = slug_ts + 300.\n")
+
     while True:
-        ts   = current_resolution_ts()
-        slug = market_slug(ts)
-        now  = int(time.time())
-        if ts - now > 305:
-            wait = ts - now - 300
-            print(f"Waiting {wait}s for market to open: {slug}", end="\r")
-            time.sleep(5)
+        slug_ts = current_slug_ts()
+        slug    = market_slug(slug_ts)
+        res_ts  = resolution_ts(slug_ts)
+        now     = int(time.time())
+        remaining = max(0, res_ts - now)
+
+        if remaining <= 0:
+            # Window already ended, wait for next
+            next_slug_ts = slug_ts + 300
+            wait = next_slug_ts - now
+            print(f"Waiting {wait}s for next window: {market_slug(next_slug_ts)}", end="\r")
+            time.sleep(2)
             continue
-        track_market(slug, ts)
+
+        track_market(slug_ts)
         print("\nWaiting 3s...\n")
         time.sleep(3)
 
@@ -802,18 +669,14 @@ if __name__ == "__main__":
 Set-Content "tracker.py" -Value $trackerPy
 
 Write-Host ""
-Write-Host "fix4 applied!" -ForegroundColor Green
+Write-Host "fix5 applied!" -ForegroundColor Green
 Write-Host ""
-Write-Host "Root cause fixed:" -ForegroundColor Yellow
-Write-Host "  The CLOB API does NOT instantly jump to 99c at resolution."
-Write-Host "  Prices at the final tick are still ~50c, so detectOutcome"
-Write-Host "  was guessing and consistently picking wrong."
+Write-Host "Root cause:" -ForegroundColor Yellow
+Write-Host "  Polymarket slug timestamps = START of the 5-minute window (floor)"
+Write-Host "  e.g. 9:25-9:30PM market -> btc-updown-5m-{9:25PM epoch}"
+Write-Host "  Resolution = slug_ts + 300 (5 minutes later)"
 Write-Host ""
-Write-Host "Solution:" -ForegroundColor Cyan
-Write-Host "  After resolution, poll every 3s for up to 60s waiting for"
-Write-Host "  one side to hit 90c+ (the real settled price)."
-Write-Host "  UI shows 'Waiting for settlement...' during this window."
-Write-Host "  If poll times out, shows low-confidence warning."
-Write-Host "  Manual UP/DOWN override buttons on every saved session row."
+Write-Host "  Old code used ceil() -> gave END/resolution timestamp -> loaded NEXT market"
+Write-Host "  New code uses floor() -> gives START timestamp -> loads CURRENT market"
 Write-Host ""
 Write-Host "Restart: npm run dev" -ForegroundColor Cyan
