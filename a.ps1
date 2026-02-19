@@ -20,61 +20,6 @@ function Backup-File([string]$Path) {
   return $bak
 }
 
-function HexToBytes([string]$hex) {
-  $h = ($hex -replace '[^0-9A-Fa-f]', '')
-  if (($h.Length % 2) -ne 0) { throw "Hex string must have even length: $hex" }
-  $bytes = New-Object byte[] ($h.Length / 2)
-  for ($i=0; $i -lt $bytes.Length; $i++) {
-    $bytes[$i] = [Convert]::ToByte($h.Substring($i*2, 2), 16)
-  }
-  return $bytes
-}
-
-function Replace-Bytes([byte[]]$data, [byte[]]$find, [byte[]]$repl) {
-  if ($find.Length -eq 0) { return ,$data }
-  $out = New-Object System.Collections.Generic.List[byte] ($data.Length)
-  $i = 0
-  while ($i -lt $data.Length) {
-    $match = $false
-    if ($i + $find.Length -le $data.Length) {
-      $match = $true
-      for ($j=0; $j -lt $find.Length; $j++) {
-        if ($data[$i+$j] -ne $find[$j]) { $match = $false; break }
-      }
-    }
-    if ($match) {
-      [void]$out.AddRange($repl)
-      $i += $find.Length
-    } else {
-      [void]$out.Add($data[$i])
-      $i++
-    }
-  }
-  return ,$out.ToArray()
-}
-
-function Normalize-FileBytes([string]$Path, $patterns) {
-  $orig = [System.IO.File]::ReadAllBytes($Path)
-  $cur = $orig
-  foreach ($p in $patterns) {
-    $cur = Replace-Bytes $cur $p.Find $p.Repl
-  }
-  if (-not ($cur.Length -eq $orig.Length -and $cur.SequenceEqual($orig))) {
-    $bak = Backup-File $Path
-    if ($DryRun) {
-      Write-Host "DRY RUN: Would normalize $Path"
-    } else {
-      [System.IO.File]::WriteAllBytes($Path, $cur)
-      Write-Host "Normalized: $Path"
-      Write-Host "Backup    : $bak"
-    }
-  }
-}
-
-function Read-TextUtf8([string]$Path) {
-  return [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
-}
-
 function Write-TextUtf8NoBom([string]$Path, [string]$Text) {
   if ($DryRun) { Write-Host "DRY RUN: Would write $Path"; return }
   $enc = New-Object System.Text.UTF8Encoding($false)
@@ -90,128 +35,12 @@ if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
 if (-not $RepoRoot) { throw "Could not find repo root (package.json). Run from repo root." }
 Write-Host "RepoRoot: $RepoRoot"
 
-# --- 0) Normalize common mojibake under src\ (byte-level; PS1 stays ASCII) ---
-# Includes: "0â€“1", "1Â¢", "Price Ã— Time", the WS dot, etc.
-$patterns = @(
-  @{ Find = (HexToBytes "C382C2A0"); Repl = [byte[]](0x20) }                          # NBSP -> space
-  @{ Find = (HexToBytes "C382C2A2"); Repl = [byte[]](0x63) }                          # "Â¢" -> "c"
-  @{ Find = (HexToBytes "C3A2C280C293"); Repl = [byte[]](0x2D) }                      # "â€“" -> "-"
-  @{ Find = (HexToBytes "C3A2C280C294"); Repl = [byte[]](0x2D) }                      # "â€”" -> "-"
-  @{ Find = (HexToBytes "C383C297"); Repl = [byte[]](0x78) }                          # "Ã" + 0x97 -> "x"
-  @{ Find = (HexToBytes "C3A2C297C28F"); Repl = [byte[]](0x2A) }                      # "â—" -> "*"
-  @{ Find = (HexToBytes "C3A2C296C2B6"); Repl = [byte[]](0x3E) }                      # "â–¶" -> ">"
-  @{ Find = (HexToBytes "C3A2C29CC293"); Repl = [byte[]](0x4F,0x4B) }                 # "âœ“" -> "OK"
-  @{ Find = (HexToBytes "C3A2C29CC297"); Repl = [byte[]](0x58) }                      # "âœ—" -> "X"
-  @{ Find = (HexToBytes "C3A2E2809DE282AC"); Repl = [byte[]](0x2D) }                  # "â”€" -> "-"
-)
-
-$srcDir = Join-Path $RepoRoot "src"
-if (Test-Path $srcDir) {
-  $files = Get-ChildItem -Path $srcDir -Recurse -File -Include *.js,*.jsx,*.ts,*.tsx -ErrorAction SilentlyContinue
-  foreach ($f in $files) {
-    try { Normalize-FileBytes $f.FullName $patterns } catch {}
-  }
-} else {
-  Write-Host "WARNING: src\ not found; skipping normalization."
-}
-
-# --- 1) Patch track page: add Download All (separate files) button ---
-$pageCandidates = Get-ChildItem -Path $RepoRoot -Recurse -File -Filter "page.js" -ErrorAction SilentlyContinue
-$pageFiles = @()
-foreach ($f in $pageCandidates) {
-  try {
-    $t = Read-TextUtf8 $f.FullName
-    if ($t -match 'STORAGE_KEY\s*=\s*"pm_sessions"' -and $t -match 'const\s+downloadSessions\s*=\s*\(\)\s*=>') {
-      $pageFiles += $f
-    }
-  } catch {}
-}
-
-foreach ($f in $pageFiles) {
-  $t = Read-TextUtf8 $f.FullName
-  $orig = $t
-
-  if ($t -notmatch 'downloadSessionsSeparate') {
-    $insertFn = @'
-const downloadSessionsSeparate = () => {
-  if (!sessions.length) return;
-
-  // One JSON file per session (browser may prompt; this is expected).
-  sessions.forEach((s, i) => {
-    const safeSlug = String(s.slug ?? `session_${i}`)
-      .replace(/[^a-zA-Z0-9._-]+/g, "_")
-      .slice(0, 180);
-
-    const ts = s.savedAt ?? Date.now();
-    const filename = `${safeSlug}_${ts}.json`;
-
-    const blob = new Blob([JSON.stringify(s, null, 2)], { type: "application/json" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = filename;
-
-    setTimeout(() => {
-      a.click();
-      setTimeout(() => URL.revokeObjectURL(a.href), 2000);
-    }, i * 200);
-  });
-};
-'@
-
-    $t = [regex]::Replace(
-      $t,
-      '(const\s+downloadSessions\s*=\s*\(\)\s*=>\s*\{[\s\S]*?\};)',
-      "`$1`n`n$insertFn",
-      "Singleline"
-    )
-  }
-
-  # Insert a new button next to the existing Download JSON button
-  if ($t -notmatch 'Download All JSON') {
-    $t = [regex]::Replace(
-      $t,
-      '(<button[^>]*onClick=\{downloadSessions\}[\s\S]*?>\s*Download JSON\s*</button>)',
-      "`$1`n<button onClick={downloadSessionsSeparate} disabled={!sessions.length} className=`"px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-lg text-sm font-semibold`">Download All JSON (separate)</button>",
-      "Singleline"
-    )
-  }
-
-  if ($t -ne $orig) {
-    $bak = Backup-File $f.FullName
-    Write-TextUtf8NoBom $f.FullName $t
-    Write-Host "Patched track page: $($f.FullName)"
-    Write-Host "Backup            : $bak"
-  }
-}
-
-# --- 2) Patch LiveTracker WS indicator to plain ASCII ---
-$liveCandidates = Get-ChildItem -Path $RepoRoot -Recurse -File -Filter "LiveTracker.js" -ErrorAction SilentlyContinue
-foreach ($f in $liveCandidates) {
-  $t = Read-TextUtf8 $f.FullName
-  $orig = $t
-
-  # Replace the exact ternary block (after normalization it often becomes "* WS" variants).
-  $t = [regex]::Replace(
-    $t,
-    '\{wsState\s*===\s*"connected"\s*\?\s*"[^"]*WS[^"]*"\s*:\s*wsState\s*===\s*"error"\s*\?\s*"[^"]*WS\s*ERR[^"]*"\s*:\s*"[^"]*WS[^"]*"\s*\}',
-    '{wsState === "connected" ? "WS" : wsState === "error" ? "WS ERR" : "WS"}',
-    "Singleline"
-  )
-
-  # Extra safety: remove any lingering "* WS" text fragments
-  $t = $t.Replace('* WS ERR', 'WS ERR').Replace('* WS', 'WS')
-
-  if ($t -ne $orig) {
-    $bak = Backup-File $f.FullName
-    Write-TextUtf8NoBom $f.FullName $t
-    Write-Host "Patched LiveTracker: $($f.FullName)"
-    Write-Host "Backup            : $bak"
-  }
-}
-
-# --- 3) Overwrite ALL BacktestEngine.js with grouped step config + best-combos table ---
+# --- Patch ALL BacktestEngine.js copies ---
 $engineFiles = Get-ChildItem -Path $RepoRoot -Recurse -File -Filter "BacktestEngine.js" -ErrorAction SilentlyContinue
 if (-not $engineFiles -or $engineFiles.Count -eq 0) { throw "No BacktestEngine.js found in repo." }
+
+Write-Host "BacktestEngine.js files found:"
+$engineFiles | ForEach-Object { Write-Host " - $($_.FullName)" }
 
 $engineText = @'
 "use client";
@@ -223,11 +52,16 @@ function clamp(n, lo, hi) {
   return Math.min(hi, Math.max(lo, x));
 }
 
-function fmtTime(sec) {
+function fmtMMSS(sec) {
   const s = clamp(Math.round(sec), 0, 300);
   const m = Math.floor(s / 60);
   const r = String(s % 60).padStart(2, "0");
   return `${m}m${r}s`;
+}
+
+function fmtPrice01(p01) {
+  const p = clamp(p01, 0, 1);
+  return `$${p.toFixed(2)}`;
 }
 
 function fmtPriceRange(centStart, centEnd) {
@@ -240,19 +74,50 @@ function opposite(side) {
   return side === "UP" ? "DOWN" : "UP";
 }
 
+// Profit model (fees/slippage ignored):
+// stake = $10, buy at price p (0..1), shares = stake/p
+// if correct -> payout = shares*$1, profit = shares - stake
+// if wrong -> payout = $0, profit = -stake
+function profitStats(stake, avgPrice01, winRate01) {
+  const s = Math.max(0, Number(stake) || 0);
+  const p = clamp(avgPrice01, 0.01, 0.99);
+  const shares = s / p;
+
+  const profitIfWin = shares - s;
+  const lossIfLose = -s;
+
+  const w = clamp(winRate01, 0, 1);
+  const expectedPL = (w * profitIfWin) + ((1 - w) * lossIfLose);
+  const expectedROI = s > 0 ? (expectedPL / s) : 0;
+
+  return {
+    stake: s,
+    shares,
+    profitIfWin,
+    lossIfLose,
+    expectedPL,
+    expectedROI
+  };
+}
+
 export default function BacktestEngine({ sessions }) {
+  // Default Entry Price Range (0-1): 0.1 - 0.9
   const [buySide, setBuySide] = useState("BOTH"); // UP, DOWN, BOTH
-  const [priceMin, setPriceMin] = useState(0.01);
-  const [priceMax, setPriceMax] = useState(0.99);
+  const [priceMin, setPriceMin] = useState(0.10);
+  const [priceMax, setPriceMax] = useState(0.90);
   const [elapsedMin, setElapsedMin] = useState(0);
   const [elapsedMax, setElapsedMax] = useState(300);
 
-  // New: group by increments (and/or)
-  const [priceStepCents, setPriceStepCents] = useState(1); // 1 or 5
-  const [timeStepSecs, setTimeStepSecs] = useState(1);     // 1 or 5
+  // Grouping increments
+  const [priceStepCents, setPriceStepCents] = useState(5); // 1,5,10
+  const [timeStepSecs, setTimeStepSecs] = useState(5);     // 1,5,10
 
+  // Best-combos table options
+  const [sortBy, setSortBy] = useState("winrate"); // winrate | roi | pl
   const [topN, setTopN] = useState(50);
   const [minSamples, setMinSamples] = useState(1);
+
+  const STAKE = 10;
 
   const [results, setResults] = useState(null);
 
@@ -262,16 +127,19 @@ export default function BacktestEngine({ sessions }) {
     const eMin = clamp(Math.min(elapsedMin, elapsedMax), 0, 300);
     const eMax = clamp(Math.max(elapsedMin, elapsedMax), 0, 300);
 
-    const ps = (Number(priceStepCents) === 5) ? 5 : 1;
-    const ts = (Number(timeStepSecs) === 5) ? 5 : 1;
+    const ps = ([1,5,10].includes(Number(priceStepCents)) ? Number(priceStepCents) : 5);
+    const ts = ([1,5,10].includes(Number(timeStepSecs)) ? Number(timeStepSecs) : 5);
+
+    const s = (sortBy === "roi" || sortBy === "pl" || sortBy === "winrate") ? sortBy : "winrate";
 
     return {
       pMin, pMax, eMin, eMax,
       ps, ts,
+      sortBy: s,
       topN: clamp(topN, 1, 500),
       minSamples: clamp(minSamples, 1, 1000000),
     };
-  }, [priceMin, priceMax, elapsedMin, elapsedMax, priceStepCents, timeStepSecs, topN, minSamples]);
+  }, [priceMin, priceMax, elapsedMin, elapsedMax, priceStepCents, timeStepSecs, sortBy, topN, minSamples]);
 
   const runBacktest = () => {
     const sides = buySide === "BOTH" ? ["UP", "DOWN"] : [buySide];
@@ -279,8 +147,8 @@ export default function BacktestEngine({ sessions }) {
     let tradesCount = 0;
     let winsCount = 0;
 
-    // Key includes side + grouped buckets
-    const m = new Map(); // key = side|secStart|centStart
+    // Key includes side + grouped remaining-time bucket + grouped price bucket
+    const cells = new Map(); // key = side|remStart|centStart
 
     for (const session of sessions) {
       const outcome = session?.outcome;
@@ -291,32 +159,45 @@ export default function BacktestEngine({ sessions }) {
         const el = point?.elapsed ?? 0;
         if (el < normalized.eMin || el > normalized.eMax) continue;
 
+        const secElapsed = clamp(Math.round(el), 0, 300);
+        const secRemaining = clamp(300 - secElapsed, 0, 300);
+
         for (const s of sides) {
           const price = (s === "DOWN") ? point?.down : point?.up;
           if (price == null) continue;
           if (price < normalized.pMin || price > normalized.pMax) continue;
 
-          const sec = clamp(Math.round(el), 0, 300);
           const cent = clamp(Math.round(price * 100), 0, 100);
           if (cent < 1 || cent > 99) continue;
 
-          // Grouping (and/or): if step is 1, buckets are exact; if 5, buckets are ranges.
-          const secStart = Math.floor(sec / normalized.ts) * normalized.ts;
-          const secEnd = Math.min(300, secStart + normalized.ts - 1);
-
+          // Group price
           const centStart = (Math.floor((cent - 1) / normalized.ps) * normalized.ps) + 1;
           const centEnd = Math.min(99, centStart + normalized.ps - 1);
+
+          // Group time REMAINING (this is the requested switch for best-combos)
+          const remStart = Math.floor(secRemaining / normalized.ts) * normalized.ts;
+          const remEnd = Math.min(300, remStart + normalized.ts - 1);
 
           const win = outcome === s;
 
           tradesCount++;
           if (win) winsCount++;
 
-          const key = `${s}|${secStart}|${centStart}`;
-          const cur = m.get(key) ?? { side: s, secStart, secEnd, centStart, centEnd, wins: 0, total: 0 };
+          const key = `${s}|${remStart}|${centStart}`;
+          const cur = cells.get(key) ?? {
+            side: s,
+            remStart, remEnd,
+            centStart, centEnd,
+            wins: 0,
+            total: 0,
+            sumPrice01: 0
+          };
+
           cur.total++;
           if (win) cur.wins++;
-          m.set(key, cur);
+          cur.sumPrice01 += price;
+
+          cells.set(key, cur);
         }
       }
     }
@@ -326,27 +207,52 @@ export default function BacktestEngine({ sessions }) {
       return;
     }
 
-    const rows = [...m.values()]
+    const rows = [...cells.values()]
       .filter(x => x.total >= normalized.minSamples)
       .map(x => {
-        const wr01 = x.wins / x.total;
-        const wr = +(wr01 * 100).toFixed(1);
-        const likelyOutcome = (wr01 >= 0.5) ? x.side : opposite(x.side);
+        const winRate01 = x.wins / x.total;
+        const winRatePct = +(winRate01 * 100).toFixed(1);
+
+        const avgPrice01 = x.sumPrice01 / x.total;
+        const pl = profitStats(STAKE, avgPrice01, winRate01);
+
+        const likelyOutcome = (winRate01 >= 0.5) ? x.side : opposite(x.side);
+
+        const priceLabel = fmtPriceRange(x.centStart, x.centEnd);
+        const timeLabel = (x.remStart === x.remEnd)
+          ? fmtMMSS(x.remStart)
+          : `${fmtMMSS(x.remStart)}-${fmtMMSS(x.remEnd)}`;
+
         return {
           ...x,
-          winRate: wr,
+          winRate01,
+          winRate: winRatePct,
+          avgPrice01,
+          avgPriceLabel: fmtPrice01(avgPrice01),
           likelyOutcome,
-          priceLabel: fmtPriceRange(x.centStart, x.centEnd),
-          timeLabel: (x.secStart === x.secEnd) ? fmtTime(x.secStart) : `${fmtTime(x.secStart)}-${fmtTime(x.secEnd)}`
+          priceLabel,
+          timeLabel, // this is TIME REMAINING label
+          winTotal: `${x.wins}/${x.total}`,
+          profitIfWin: +pl.profitIfWin.toFixed(2),
+          expectedPL: +pl.expectedPL.toFixed(2),
+          expectedROI: +(pl.expectedROI * 100).toFixed(2) // percent
         };
-      })
-      .sort((a, b) => (b.winRate - a.winRate) || (b.total - a.total) || (a.secStart - b.secStart) || (a.centStart - b.centStart))
-      .slice(0, normalized.topN);
+      });
+
+    rows.sort((a, b) => {
+      if (normalized.sortBy === "roi") {
+        return (b.expectedROI - a.expectedROI) || (b.winRate - a.winRate) || (b.total - a.total);
+      }
+      if (normalized.sortBy === "pl") {
+        return (b.expectedPL - a.expectedPL) || (b.winRate - a.winRate) || (b.total - a.total);
+      }
+      return (b.winRate - a.winRate) || (b.total - a.total) || (a.remStart - b.remStart) || (a.centStart - b.centStart);
+    });
 
     setResults({
       summary: { total: tradesCount, wins: winsCount, winRate: winsCount / tradesCount },
-      rows,
-      debug: { trades: tradesCount, cells: m.size, ps: normalized.ps, ts: normalized.ts }
+      rows: rows.slice(0, normalized.topN),
+      debug: { trades: tradesCount, cells: cells.size, priceStep: normalized.ps, timeStep: normalized.ts, sortBy: normalized.sortBy }
     });
   };
 
@@ -379,10 +285,11 @@ export default function BacktestEngine({ sessions }) {
                 onChange={e => setPriceMax(+e.target.value)}
                 className="w-24 bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-1.5 text-sm text-[var(--text1)]" />
             </div>
+            <p className="text-xs text-[var(--text3)] mt-1">Default is 0.10 to 0.90.</p>
           </div>
 
           <div>
-            <label className="text-xs text-[var(--text2)] block mb-1">Time Elapsed Range (seconds 0-300)</label>
+            <label className="text-xs text-[var(--text2)] block mb-1">Time Elapsed Range filter (seconds 0-300)</label>
             <div className="flex gap-2 items-center">
               <input type="number" min="0" max="300" step="1" value={elapsedMin}
                 onChange={e => setElapsedMin(+e.target.value)}
@@ -392,23 +299,36 @@ export default function BacktestEngine({ sessions }) {
                 onChange={e => setElapsedMax(+e.target.value)}
                 className="w-24 bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-1.5 text-sm text-[var(--text1)]" />
             </div>
+            <p className="text-xs text-[var(--text3)] mt-1">Best-combos table uses time remaining (300 - elapsed).</p>
           </div>
 
           <div>
-            <label className="text-xs text-[var(--text2)] block mb-1">Group Price By</label>
+            <label className="text-xs text-[var(--text2)] block mb-1">Group Price by</label>
             <select value={priceStepCents} onChange={e => setPriceStepCents(+e.target.value)}
               className="w-full bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-2 text-sm text-[var(--text1)]">
               <option value={1}>1 cent</option>
               <option value={5}>5 cents</option>
+              <option value={10}>10 cents</option>
             </select>
           </div>
 
           <div>
-            <label className="text-xs text-[var(--text2)] block mb-1">Group Time By</label>
+            <label className="text-xs text-[var(--text2)] block mb-1">Group Time by</label>
             <select value={timeStepSecs} onChange={e => setTimeStepSecs(+e.target.value)}
               className="w-full bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-2 text-sm text-[var(--text1)]">
               <option value={1}>1 second</option>
               <option value={5}>5 seconds</option>
+              <option value={10}>10 seconds</option>
+            </select>
+          </div>
+
+          <div>
+            <label className="text-xs text-[var(--text2)] block mb-1">Sort best combos by</label>
+            <select value={sortBy} onChange={e => setSortBy(e.target.value)}
+              className="w-full bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-2 text-sm text-[var(--text1)]">
+              <option value="winrate">WinRate</option>
+              <option value="roi">Profitable (Expected ROI % on $10)</option>
+              <option value="pl">Expected P/L ($10 stake)</option>
             </select>
           </div>
 
@@ -431,6 +351,10 @@ export default function BacktestEngine({ sessions }) {
           className="w-full py-3 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-xl font-bold text-base">
           Run Backtest ({sessions.length} session{sessions.length !== 1 ? "s" : ""} loaded)
         </button>
+
+        <p className="text-xs text-[var(--text3)]">
+          Profit model assumes $10 stake per order, shares = 10/price, payout $1 per share if correct, $0 if wrong (fees ignored).
+        </p>
       </div>
 
       {results && (
@@ -448,11 +372,11 @@ export default function BacktestEngine({ sessions }) {
               </div>
 
               <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-4 shadow-sm">
-                <p className="text-sm font-bold mb-2">Best price + time combos (sorted by win rate)</p>
+                <p className="text-sm font-bold mb-2">Best price + time combos (sorted by selected metric)</p>
 
                 {results.rows.length === 0 ? (
                   <div className="text-sm text-[var(--text3)]">
-                    No rows. Lower Min samples, or widen filters, and confirm sessions have outcomes.
+                    No rows. Lower Min samples, widen filters, and confirm sessions have outcomes.
                   </div>
                 ) : (
                   <div className="overflow-x-auto">
@@ -460,12 +384,15 @@ export default function BacktestEngine({ sessions }) {
                       <thead>
                         <tr className="text-[var(--text3)] border-b border-[var(--border)]">
                           <th className="text-left py-1 pr-4">Side</th>
-                          <th className="text-right pr-4">Price</th>
-                          <th className="text-right pr-4">Elapsed</th>
+                          <th className="text-right pr-4">Price bucket</th>
+                          <th className="text-right pr-4">Avg price</th>
+                          <th className="text-right pr-4">Time remaining</th>
                           <th className="text-right pr-4">WinRate</th>
-                          <th className="text-right pr-4">Wins</th>
-                          <th className="text-right pr-4">N</th>
-                          <th className="text-right">Likely outcome</th>
+                          <th className="text-right pr-4">Win/Total</th>
+                          <th className="text-right pr-4">ProfitIfWin</th>
+                          <th className="text-right pr-4">Exp P/L</th>
+                          <th className="text-right pr-4">Exp ROI%</th>
+                          <th className="text-right">Likely</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -473,10 +400,13 @@ export default function BacktestEngine({ sessions }) {
                           <tr key={i} className="border-b border-[var(--border)] hover:bg-[var(--bg2)]">
                             <td className={`py-1 pr-4 font-bold ${r.side === "UP" ? "text-green-600" : "text-red-600"}`}>{r.side}</td>
                             <td className="text-right pr-4">{r.priceLabel}</td>
+                            <td className="text-right pr-4">{r.avgPriceLabel}</td>
                             <td className="text-right pr-4">{r.timeLabel}</td>
                             <td className="text-right pr-4">{r.winRate}%</td>
-                            <td className="text-right pr-4">{r.wins}</td>
-                            <td className="text-right pr-4">{r.total}</td>
+                            <td className="text-right pr-4">{r.winTotal}</td>
+                            <td className="text-right pr-4">${r.profitIfWin.toFixed(2)}</td>
+                            <td className={`text-right pr-4 font-bold ${r.expectedPL >= 0 ? "text-green-600" : "text-red-600"}`}>${r.expectedPL.toFixed(2)}</td>
+                            <td className={`text-right pr-4 font-bold ${r.expectedROI >= 0 ? "text-green-600" : "text-red-600"}`}>{r.expectedROI.toFixed(2)}%</td>
                             <td className="text-right font-bold">{r.likelyOutcome}</td>
                           </tr>
                         ))}
@@ -486,7 +416,7 @@ export default function BacktestEngine({ sessions }) {
                 )}
 
                 <div className="text-xs text-[var(--text3)] mt-3">
-                  Debug: trades={results.debug?.trades ?? 0}, cells={results.debug?.cells ?? 0}, priceStep={results.debug?.ps ?? "?"}c, timeStep={results.debug?.ts ?? "?"}s
+                  Debug: trades={results.debug?.trades ?? 0}, cells={results.debug?.cells ?? 0}, priceStep={results.debug?.priceStep ?? "?"}c, timeStep={results.debug?.timeStep ?? "?"}s, sortBy={results.debug?.sortBy ?? "?"}
                 </div>
               </div>
             </>
@@ -511,8 +441,10 @@ function SCard({ label, value, color }) {
 }
 '@
 
-# Guard: keep ASCII-only JS to avoid encoding/parser issues
-foreach ($ch in $engineText.ToCharArray()) { if ([int][char]$ch -gt 127) { throw "BacktestEngine.js text not ASCII-only; aborting." } }
+# Guard: ensure ASCII-only JS to avoid mojibake/encoding issues
+foreach ($ch in $engineText.ToCharArray()) {
+  if ([int][char]$ch -gt 127) { throw "BacktestEngine.js content contains non-ASCII; aborting." }
+}
 
 foreach ($f in $engineFiles) {
   $bak = Backup-File $f.FullName
@@ -525,20 +457,15 @@ foreach ($f in $engineFiles) {
   }
 }
 
-# --- Verify key markers ---
+# --- Verify markers ---
 if (-not $DryRun) {
   foreach ($f in $engineFiles) {
-    $t = Read-TextUtf8 $f.FullName
-    if ($t -notmatch 'priceStepCents' -or $t -notmatch 'timeStepSecs' -or $t -notmatch 'Best price \+ time combos') {
+    $t = [System.IO.File]::ReadAllText($f.FullName, [System.Text.Encoding]::UTF8)
+    if ($t -notmatch 'time remaining' -or $t -notmatch 'priceStepCents' -or $t -notmatch 'timeStepSecs' -or $t -notmatch 'Win/Total' -or $t -notmatch 'Expected ROI') {
       throw "Verification failed for $($f.FullName): markers missing."
     }
-  }
-  foreach ($f in $pageFiles) {
-    $t = Read-TextUtf8 $f.FullName
-    if ($t -notmatch 'downloadSessionsSeparate' -or $t -notmatch 'Download All JSON') {
-      throw "Verification failed for $($f.FullName): download-all button missing."
-    }
+    Write-Host "Verified: $($f.FullName)"
   }
 }
 
-Write-Host "Done. Restart dev server (Ctrl+C then npm run dev). If UI is still stale, delete .next\ and restart."
+Write-Host "Done. Restart dev server (Ctrl+C then npm run dev). If stale, delete .next\ and restart."
