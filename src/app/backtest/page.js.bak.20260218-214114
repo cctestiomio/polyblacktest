@@ -1,4 +1,8 @@
-|,)\s*useEffect\s*(,|$)') { return $m.Value }
+"use client";
+
+        param($m)
+        $inside = $m.Groups[1].Value
+        if ($inside -match '(^|,)\s*useEffect\s*(,|$)') { return $m.Value }
         return 'import { ' + $inside.Trim() + ', useEffect } from "react";'
       
 import Link from "next/link";

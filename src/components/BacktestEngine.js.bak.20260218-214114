@@ -451,6 +451,7 @@ export default function BacktestEngine({ sessions }) {
                   <th className="text-left py-1 pr-4">Side</th>
                   <th className="text-right pr-4">Price bucket</th>
                   <th className="text-right pr-4">Avg price</th>
+                  <th className="text-right pr-4">Start price</th>
                   <th className="text-right pr-4">Time remaining</th>
                   <th className="text-right pr-4">Delta bucket</th>
                   <th className="text-right pr-4">Avg delta</th>
@@ -466,6 +467,7 @@ export default function BacktestEngine({ sessions }) {
                     <td className={`py-1 pr-4 font-bold ${r.side === "UP" ? "text-green-600" : "text-red-600"}`}>{r.side}</td>
                     <td className="text-right pr-4">{r.priceLabel}</td>
                     <td className="text-right pr-4">{r.avgPriceLabel}</td>
+                    <td className="text-right pr-4">{r.avgStartPriceLabel}</td>
                     <td className="text-right pr-4">{r.timeLabel}</td>
                     <td className="text-right pr-4">{r.deltaBucketLabel}</td>
                     <td className="text-right pr-4">{r.avgDeltaLabel}</td>
