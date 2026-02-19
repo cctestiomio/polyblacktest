@@ -1,13 +1,20 @@
-<# patch-backtestengine-best-combos.ps1
-   - Overwrites src/components/BacktestEngine.js
-   - Defaults Entry Price Range to 0.01 .. 0.99
-   - After "Run Backtest", computes best (price cent + elapsed second) combos and shows them
-     sorted by win rate (highest -> lowest) in a bar chart.
-   - Also includes 1c and 1s charts and a simple mojibake-fix pass on key UI files.
+<# patch-backtest-best-combos-and-fix-text.ps1
+   - Overwrites src/components/BacktestEngine.js with:
+       * default price range 0.01..0.99
+       * "Best price+time combos" chart sorted by win rate desc
+       * "What-if" lookup (buy UP/DOWN at price+time -> win rate + likely outcome)
+     Uses ASCII-only UI strings (no special symbols).
+
+   - Also fixes mojibake / weird characters in common UI files:
+       src/components/LiveTracker.js
+       src/app/page.js
+       src/app/backtest/page.js
+
+   Creates timestamped .bak backups and writes UTF-8 without BOM.
 
    Usage:
-     .\patch-backtestengine-best-combos.ps1
-     .\patch-backtestengine-best-combos.ps1 -DryRun
+     .\patch-backtest-best-combos-and-fix-text.ps1
+     .\patch-backtest-best-combos-and-fix-text.ps1 -DryRun
 #>
 
 param(
@@ -32,10 +39,10 @@ function Backup-And-Write([string]$Path, [string]$NewText) {
   Write-Host "Backup : $backup"
 }
 
-function Fix-Mojibake([string]$Text) {
+function Fix-WeirdText([string]$Text) {
+  # Mojibake -> ASCII
   $map = [ordered]@{
-    # Common mojibake sequences -> ASCII-safe
-    "Ã—" = "x"
+    "Ã—"  = "x"
     "â€“" = "-"
     "â€”" = "-"
     "â€¦" = "..."
@@ -45,21 +52,25 @@ function Fix-Mojibake([string]$Text) {
     "â€˜" = "'"
     "â€™" = "'"
     "Â "  = " "
-    "Â¢"  = "c"
     "Â·"  = " - "
+    "Â¢"  = "c"
+    "â—" = "*"   # ws dot mojibake
+    "â—‹" = "o"
+    "â–²" = "^"
+    "â–¼" = "v"
   }
   foreach ($k in $map.Keys) { $Text = $Text.Replace($k, $map[$k]) }
 
-  # Normalize a few symbols so you don't fight encoding again
+  # Normalize remaining non-ASCII symbols to ASCII to avoid future encoding fights
+  $Text = $Text.Replace("×","x").Replace("–","-").Replace("—","-")
   $Text = $Text.Replace("¢","c")
-  $Text = $Text.Replace("×","x")
-  $Text = $Text.Replace("–","-")
-  $Text = $Text.Replace("—","-")
+  $Text = $Text.Replace("●","*").Replace("○","o").Replace("▲","^").Replace("▼","v")
+  $Text = $Text.Replace("✓","OK").Replace("✗","X")
 
   return $Text
 }
 
-# -------- Overwrite BacktestEngine.js --------
+# ---------- 1) Overwrite BacktestEngine.js ----------
 $enginePath = Join-Path $RepoRoot "src\components\BacktestEngine.js"
 if (-not (Test-Path $enginePath)) {
   Write-Error "Cannot find: $enginePath"
@@ -71,11 +82,8 @@ $engineNew = @'
 import { useMemo, useState } from "react";
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid,
-  ResponsiveContainer, Cell, LineChart, Line,
+  ResponsiveContainer, Cell,
 } from "recharts";
-
-const PRICE_CENTS = Array.from({ length: 99 }, (_, i) => i + 1); // 1..99
-const TIME_SECS = Array.from({ length: 301 }, (_, i) => i);      // 0..300
 
 function clamp(n, lo, hi) {
   const x = Number(n);
@@ -83,16 +91,34 @@ function clamp(n, lo, hi) {
   return Math.min(hi, Math.max(lo, x));
 }
 
+function fmtPriceDollarsFromCent(cent) {
+  return `$${(cent / 100).toFixed(2)}`;
+}
+
+function fmtTime(sec) {
+  const s = Math.max(0, Math.min(300, Math.round(sec)));
+  const m = Math.floor(s / 60);
+  const r = String(s % 60).padStart(2, "0");
+  return `${m}m${r}s`;
+}
+
 export default function BacktestEngine({ sessions }) {
-  const [side, setSide] = useState("UP");          // UP, DOWN, BOTH
-  const [priceMin, setPriceMin] = useState(0.01);  // default per request
-  const [priceMax, setPriceMax] = useState(0.99);  // default per request
+  // Defaults per request
+  const [buySide, setBuySide] = useState("BOTH"); // UP, DOWN, BOTH
+  const [priceMin, setPriceMin] = useState(0.01);
+  const [priceMax, setPriceMax] = useState(0.99);
   const [elapsedMin, setElapsedMin] = useState(0);
   const [elapsedMax, setElapsedMax] = useState(300);
 
-  const [view, setView] = useState("bestCombos"); // bestCombos | price | time
-  const [topN, setTopN] = useState(25);
+  // Ranking controls
+  const [rankSide, setRankSide] = useState("BOTH"); // UP, DOWN, BOTH
+  const [topN, setTopN] = useState(30);
   const [minSamples, setMinSamples] = useState(10);
+
+  // What-if query
+  const [qSide, setQSide] = useState("UP");
+  const [qPrice, setQPrice] = useState(0.60);
+  const [qElapsed, setQElapsed] = useState(120);
 
   const [results, setResults] = useState(null);
 
@@ -110,13 +136,17 @@ export default function BacktestEngine({ sessions }) {
   }, [priceMin, priceMax, elapsedMin, elapsedMax, topN, minSamples]);
 
   const runBacktest = () => {
-    const sides = side === "BOTH" ? ["UP","DOWN"] : [side];
+    const sides = buySide === "BOTH" ? ["UP", "DOWN"] : [buySide];
+
     const trades = [];
+    const comboBySide = { UP: new Map(), DOWN: new Map() }; // key=sec*100+cent -> {wins,total,sec,cent,side}
 
     for (const session of sessions) {
-      if (!session?.outcome) continue;
+      const outcome = session?.outcome;
+      if (!outcome) continue;
 
-      for (const point of session.priceHistory ?? []) {
+      const points = Array.isArray(session?.priceHistory) ? session.priceHistory : [];
+      for (const point of points) {
         const el = point?.elapsed ?? 0;
         if (el < normalized.eMin || el > normalized.eMax) continue;
 
@@ -125,93 +155,115 @@ export default function BacktestEngine({ sessions }) {
           if (price == null) continue;
           if (price < normalized.pMin || price > normalized.pMax) continue;
 
-          const win = session.outcome === s;
+          const sec = clamp(Math.round(el), 0, 300);
+          const cent = clamp(Math.round(price * 100), 0, 100);
+          if (cent < 1 || cent > 99) continue;
+
+          const win = outcome === s;
+
           trades.push({
-            slug: session.slug ?? "?",
-            elapsed: el,
-            price,
+            slug: session?.slug ?? "?",
+            elapsed: sec,
+            price: cent / 100,
             side: s,
-            outcome: session.outcome,
+            outcome,
             win,
           });
+
+          const key = (sec * 100) + cent;
+          const m = comboBySide[s];
+          const cur = m.get(key) ?? { wins: 0, total: 0, sec, cent, side: s };
+          cur.total++;
+          if (win) cur.wins++;
+          m.set(key, cur);
         }
       }
     }
 
     if (!trades.length) {
-      setResults({ trades: [], summary: null, chartPrice: [], chartTime: [], bestCombos: [] });
+      setResults({ trades: [], summary: null, bestCombos: [], comboBySide });
       return;
     }
 
     const wins = trades.reduce((acc, t) => acc + (t.win ? 1 : 0), 0);
     const winRate = wins / trades.length;
 
-    // --- 1c chart ---
-    const byCent = new Array(100).fill(null).map(() => ({ wins: 0, total: 0 }));
-    // --- 1s chart ---
-    const bySec = new Array(301).fill(null).map(() => ({ wins: 0, total: 0 }));
-    // --- combo stats (sec + cent) ---
-    const combo = new Map(); // key = sec*100 + cent
-
-    for (const t of trades) {
-      const cent = clamp(Math.round(t.price * 100), 0, 100);
-      const sec = clamp(Math.round(t.elapsed), 0, 300);
-
-      if (cent >= 1 && cent <= 99) {
-        byCent[cent].total++; if (t.win) byCent[cent].wins++;
-        const key = (sec * 100) + cent;
-        const cur = combo.get(key) ?? { wins: 0, total: 0, sec, cent };
-        cur.total++; if (t.win) cur.wins++;
-        combo.set(key, cur);
-      }
-
-      bySec[sec].total++; if (t.win) bySec[sec].wins++;
+    // Build ranked list
+    let pool = [];
+    if (rankSide === "BOTH") {
+      pool = [
+        ...Array.from(comboBySide.UP.values()),
+        ...Array.from(comboBySide.DOWN.values()),
+      ];
+    } else {
+      pool = Array.from(comboBySide[rankSide].values());
     }
 
-    const chartPrice = PRICE_CENTS.map((c) => {
-      const { wins, total } = byCent[c];
-      return {
-        cent: c,
-        label: `${c}c`,
-        winRate: total ? +((wins / total) * 100).toFixed(1) : null,
-        wins,
-        total,
-      };
-    });
-
-    const chartTime = TIME_SECS.map((s) => {
-      const { wins, total } = bySec[s];
-      return {
-        sec: s,
-        label: `${s}s`,
-        winRate: total ? +((wins / total) * 100).toFixed(1) : null,
-        wins,
-        total,
-      };
-    });
-
-    const bestCombos = Array.from(combo.values())
+    const bestCombos = pool
       .filter(x => x.total >= normalized.minSamples)
-      .map(x => ({
-        sec: x.sec,
-        cent: x.cent,
-        label: `${x.cent}c @ ${x.sec}s`,
-        wins: x.wins,
-        total: x.total,
-        winRate: +((x.wins / x.total) * 100).toFixed(1),
-      }))
+      .map(x => {
+        const wr = (x.wins / x.total) * 100;
+        const priceStr = fmtPriceDollarsFromCent(x.cent);
+        const timeStr = fmtTime(x.sec);
+        const label = rankSide === "BOTH"
+          ? `${x.side} ${priceStr} @ ${timeStr}`
+          : `${priceStr} @ ${timeStr}`;
+
+        return {
+          side: x.side,
+          cent: x.cent,
+          sec: x.sec,
+          label,
+          wins: x.wins,
+          total: x.total,
+          winRate: +wr.toFixed(1),
+        };
+      })
       .sort((a, b) => (b.winRate - a.winRate) || (b.total - a.total) || (a.sec - b.sec) || (a.cent - b.cent))
       .slice(0, normalized.topN);
 
     setResults({
       trades,
       summary: { total: trades.length, wins, winRate },
-      chartPrice,
-      chartTime,
       bestCombos,
-      params: { ...normalized, side },
+      comboBySide,
+      params: { ...normalized, buySide, rankSide },
     });
   };
+
+  const whatIf = useMemo(() => {
+    if (!results?.comboBySide) return null;
+
+    const side = qSide;
+    const sec = clamp(Math.round(qElapsed), 0, 300);
+    const cent = clamp(Math.round(clamp(qPrice, 0, 1) * 100), 0, 100);
+
+    if (cent < 1 || cent > 99) {
+      return { ok: false, msg: "Price must round to between $0.01 and $0.99." };
+    }
+
+    const key = (sec * 100) + cent;
+    const cell = results.comboBySide[side].get(key);
+    if (!cell || !cell.total) {
+      return { ok: false, msg: "No matching samples for that exact price+time (try widening filters or pick a nearby value)." };
+    }
+
+    const wr = (cell.wins / cell.total) * 100;
+    const likelyOutcome = (wr >= 50) ? side : (side === "UP" ? "DOWN" : "UP");
+
+    return {
+      ok: true,
+      side,
+      sec,
+      cent,
+      priceStr: fmtPriceDollarsFromCent(cent),
+      timeStr: fmtTime(sec),
+      winRate: +wr.toFixed(1),
+      wins: cell.wins,
+      total: cell.total,
+      likelyOutcome,
+    };
+  }, [results, qSide, qPrice, qElapsed]);
 
   return (
     <div className="space-y-6">
@@ -223,38 +275,31 @@ export default function BacktestEngine({ sessions }) {
             <label className="text-xs text-[var(--text2)] block mb-1">Buy Side</label>
             <div className="flex gap-2">
               {["UP","DOWN","BOTH"].map(s => (
-                <button
-                  key={s}
-                  onClick={() => setSide(s)}
+                <button key={s} onClick={() => setBuySide(s)}
                   className={`flex-1 py-2 rounded-lg font-bold text-sm transition ${
-                    side===s
+                    buySide===s
                       ? "bg-indigo-600 text-white"
                       : "bg-[var(--bg2)] hover:bg-[var(--bg3)] text-[var(--text1)] border border-[var(--border)]"
-                  }`}
-                >
-                  {s}
-                </button>
+                  }`}>{s}</button>
               ))}
             </div>
           </div>
 
           <div>
-            <label className="text-xs text-[var(--text2)] block mb-1">Output View</label>
+            <label className="text-xs text-[var(--text2)] block mb-1">Rank combos for</label>
             <div className="flex gap-2">
-              {[["bestCombos","Best Price+Time"],["price","Entry Price (1c)"],["time","Elapsed Time (1s)"]].map(([v,l]) => (
-                <button
-                  key={v}
-                  onClick={() => setView(v)}
-                  className={`flex-1 py-2 rounded-lg text-sm transition ${
-                    view===v
+              {["UP","DOWN","BOTH"].map(s => (
+                <button key={s} onClick={() => setRankSide(s)}
+                  className={`flex-1 py-2 rounded-lg font-bold text-sm transition ${
+                    rankSide===s
                       ? "bg-indigo-600 text-white"
                       : "bg-[var(--bg2)] hover:bg-[var(--bg3)] text-[var(--text1)] border border-[var(--border)]"
-                  }`}
-                >
-                  {l}
-                </button>
+                  }`}>{s}</button>
               ))}
             </div>
+            <p className="text-xs text-[var(--text3)] mt-1">
+              "Win rate" means: if you buy that token at that exact price+time, how often the final outcome matches your token.
+            </p>
           </div>
 
           <div>
@@ -268,7 +313,7 @@ export default function BacktestEngine({ sessions }) {
                 onChange={e => setPriceMax(+e.target.value)}
                 className="w-24 bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-1.5 text-sm text-[var(--text1)]" />
             </div>
-            <p className="text-xs text-[var(--text3)] mt-1">Default is 0.01-0.99 to show full domain</p>
+            <p className="text-xs text-[var(--text3)] mt-1">Default is 0.01 to 0.99.</p>
           </div>
 
           <div>
@@ -285,22 +330,18 @@ export default function BacktestEngine({ sessions }) {
           </div>
 
           <div>
-            <label className="text-xs text-[var(--text2)] block mb-1">Top N combos (for Best Price+Time)</label>
-            <input
-              type="number" min="5" max="200" step="1" value={topN}
+            <label className="text-xs text-[var(--text2)] block mb-1">Top N combos to show</label>
+            <input type="number" min="5" max="200" step="1" value={topN}
               onChange={e => setTopN(+e.target.value)}
-              className="w-full bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-2 text-sm text-[var(--text1)]"
-            />
+              className="w-full bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-2 text-sm text-[var(--text1)]" />
           </div>
 
           <div>
             <label className="text-xs text-[var(--text2)] block mb-1">Min samples per combo (n)</label>
-            <input
-              type="number" min="1" step="1" value={minSamples}
+            <input type="number" min="1" step="1" value={minSamples}
               onChange={e => setMinSamples(+e.target.value)}
-              className="w-full bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-2 text-sm text-[var(--text1)]"
-            />
-            <p className="text-xs text-[var(--text3)] mt-1">Increase this to avoid "lucky" 1-of-1 cells.</p>
+              className="w-full bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-2 text-sm text-[var(--text1)]" />
+            <p className="text-xs text-[var(--text3)] mt-1">Increase to avoid 1-of-1 lucky cells.</p>
           </div>
         </div>
 
@@ -319,93 +360,87 @@ export default function BacktestEngine({ sessions }) {
                 <SCard label="Wins" value={results.summary.wins} color="text-green-600 dark:text-green-400" />
                 <SCard
                   label="Win Rate"
-                  value={`${(results.summary.winRate*100).toFixed(1)}%`}
+                  value={`${(results.summary.winRate * 100).toFixed(1)}%`}
                   color={results.summary.winRate >= 0.5 ? "text-green-600 dark:text-green-400" : "text-red-600 dark:text-red-400"}
                 />
               </div>
 
-              {view === "bestCombos" && (
-                <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-4 shadow-sm" style={{ height: 520 }}>
-                  <p className="text-xs text-[var(--text2)] mb-3">
-                    Best Price+Time combos (sorted highest to lowest win rate)
+              {/* What-if lookup */}
+              <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-4 shadow-sm space-y-3">
+                <p className="text-sm font-bold">What happens if I buy at an exact price+time?</p>
+                <div className="grid grid-cols-1 sm:grid-cols-4 gap-3 items-end">
+                  <div>
+                    <label className="text-xs text-[var(--text2)] block mb-1">Buy token</label>
+                    <select value={qSide} onChange={e => setQSide(e.target.value)}
+                      className="w-full bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-2 text-sm text-[var(--text1)]">
+                      <option value="UP">UP (YES)</option>
+                      <option value="DOWN">DOWN (NO)</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-xs text-[var(--text2)] block mb-1">Entry price (0-1)</label>
+                    <input type="number" min="0" max="1" step="0.01" value={qPrice}
+                      onChange={e => setQPrice(+e.target.value)}
+                      className="w-full bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-2 text-sm text-[var(--text1)]" />
+                  </div>
+                  <div>
+                    <label className="text-xs text-[var(--text2)] block mb-1">Elapsed seconds (0-300)</label>
+                    <input type="number" min="0" max="300" step="1" value={qElapsed}
+                      onChange={e => setQElapsed(+e.target.value)}
+                      className="w-full bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-2 text-sm text-[var(--text1)]" />
+                  </div>
+                  <div className="text-sm">
+                    {whatIf?.ok ? (
+                      <div className="rounded-lg border border-[var(--border)] bg-[var(--bg2)] px-3 py-2">
+                        <div className="font-semibold">{whatIf.side} at {whatIf.priceStr} and {whatIf.timeStr}</div>
+                        <div>Historical win rate: {whatIf.winRate}% (wins={whatIf.wins}, n={whatIf.total})</div>
+                        <div>Likely outcome: {whatIf.likelyOutcome}</div>
+                      </div>
+                    ) : (
+                      <div className="text-[var(--text3)]">{whatIf?.msg ?? "Run a backtest to enable lookup."}</div>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* Best combos chart */}
+              <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-4 shadow-sm" style={{ height: 560 }}>
+                <p className="text-sm font-bold mb-2">Best price+time combos (sorted highest to lowest win rate)</p>
+                <p className="text-xs text-[var(--text3)] mb-3">
+                  Each bar is one exact combo. Tooltip shows win rate and sample size.
+                </p>
+
+                <ResponsiveContainer width="100%" height="90%">
+                  <BarChart
+                    data={results.bestCombos}
+                    layout="vertical"
+                    margin={{ left: 20, right: 20, top: 10, bottom: 10 }}
+                  >
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+                    <XAxis type="number" domain={[0, 100]} tickFormatter={(v) => `${v}%`} stroke="#94a3b8" tick={{ fontSize: 11 }} />
+                    <YAxis type="category" dataKey="label" width={170} stroke="#94a3b8" tick={{ fontSize: 11 }} />
+                    <Tooltip
+                      formatter={(v, n, ctx) => {
+                        const p = ctx?.payload;
+                        if (!p) return [v, n];
+                        return [`${p.winRate}% (wins=${p.wins}, n=${p.total})`, "Win Rate"];
+                      }}
+                      contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 8 }}
+                    />
+                    <Bar dataKey="winRate" radius={[4,4,4,4]}>
+                      {results.bestCombos.map((e, i) => (
+                        <Cell key={i} fill={e.winRate >= 50 ? "#16a34a" : "#dc2626"} />
+                      ))}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+
+                {results.bestCombos.length === 0 && (
+                  <p className="text-xs text-[var(--text3)] mt-3">
+                    No combos met min samples. Lower min samples or widen filters.
                   </p>
-                  <ResponsiveContainer width="100%" height="92%">
-                    <BarChart data={results.bestCombos} layout="vertical" margin={{ left: 20, right: 20, top: 10, bottom: 10 }}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-                      <XAxis type="number" domain={[0, 100]} tickFormatter={(v) => `${v}%`} stroke="#94a3b8" tick={{ fontSize: 11 }} />
-                      <YAxis type="category" dataKey="label" width={120} stroke="#94a3b8" tick={{ fontSize: 11 }} />
-                      <Tooltip
-                        formatter={(v, n, ctx) => {
-                          const p = ctx?.payload;
-                          if (!p) return [v, n];
-                          return [`${p.winRate}% (wins=${p.wins}, n=${p.total})`, "Win Rate"];
-                        }}
-                        contentStyle={{ background:"var(--card)", border:"1px solid var(--border)", borderRadius:8 }}
-                      />
-                      <Bar dataKey="winRate" radius={[4,4,4,4]}>
-                        {results.bestCombos.map((e, i) => (
-                          <Cell key={i} fill={e.winRate >= 50 ? "#16a34a" : "#dc2626"} />
-                        ))}
-                      </Bar>
-                    </BarChart>
-                  </ResponsiveContainer>
-                  {results.bestCombos.length === 0 && (
-                    <p className="text-xs text-[var(--text3)] mt-3">
-                      No combos met min samples. Lower min samples (n) or widen your filters.
-                    </p>
-                  )}
-                </div>
-              )}
-
-              {view === "price" && (
-                <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-4 shadow-sm" style={{ height: 340 }}>
-                  <p className="text-xs text-[var(--text2)] mb-3">Win Rate by Entry Price (1c increments)</p>
-                  <ResponsiveContainer width="100%" height="90%">
-                    <BarChart data={results.chartPrice}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-                      <XAxis dataKey="cent" tickFormatter={(v) => `${v}c`} interval={9} stroke="#94a3b8" tick={{ fontSize: 11 }} />
-                      <YAxis domain={[0,100]} tickFormatter={(v) => `${v}%`} stroke="#94a3b8" tick={{ fontSize: 11 }} />
-                      <Tooltip
-                        formatter={(v, n, ctx) => {
-                          const p = ctx?.payload;
-                          if (!p) return [v, n];
-                          return [p.total ? `${p.winRate}% (n=${p.total})` : "no data", "Win Rate"];
-                        }}
-                        labelFormatter={(cent) => `${cent}c`}
-                        contentStyle={{ background:"var(--card)", border:"1px solid var(--border)", borderRadius:8 }}
-                      />
-                      <Bar dataKey="winRate" radius={[3,3,0,0]}>
-                        {results.chartPrice.map((e,i) => (
-                          <Cell key={i} fill={e.winRate == null ? "rgba(148,163,184,0.25)" : (e.winRate >= 50 ? "#16a34a" : "#dc2626")} />
-                        ))}
-                      </Bar>
-                    </BarChart>
-                  </ResponsiveContainer>
-                </div>
-              )}
-
-              {view === "time" && (
-                <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-4 shadow-sm" style={{ height: 340 }}>
-                  <p className="text-xs text-[var(--text2)] mb-3">Win Rate by Elapsed Time (1s increments)</p>
-                  <ResponsiveContainer width="100%" height="90%">
-                    <LineChart data={results.chartTime}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-                      <XAxis dataKey="sec" tickFormatter={(v) => `${v}s`} interval={29} stroke="#94a3b8" tick={{ fontSize: 11 }} />
-                      <YAxis domain={[0,100]} tickFormatter={(v) => `${v}%`} stroke="#94a3b8" tick={{ fontSize: 11 }} />
-                      <Tooltip
-                        formatter={(v, n, ctx) => {
-                          const p = ctx?.payload;
-                          if (!p) return [v, n];
-                          return [p.total ? `${p.winRate}% (n=${p.total})` : "no data", "Win Rate"];
-                        }}
-                        labelFormatter={(sec) => `${sec}s`}
-                        contentStyle={{ background:"var(--card)", border:"1px solid var(--border)", borderRadius:8 }}
-                      />
-                      <Line type="monotone" dataKey="winRate" stroke="#6366f1" dot={false} connectNulls={false} strokeWidth={2} />
-                    </LineChart>
-                  </ResponsiveContainer>
-                </div>
-              )}
+                )}
+              </div>
             </>
           ) : (
             <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-6 text-center text-[var(--text3)]">
@@ -428,23 +463,28 @@ function SCard({ label, value, color }) {
 }
 '@
 
-$engineNew = Fix-Mojibake $engineNew
+$engineNew = Fix-WeirdText $engineNew
 Backup-And-Write -Path $enginePath -NewText $engineNew
 
-# -------- Mojibake-fix pass on other UI files --------
-$other = @(
+# ---------- 2) Fix weird characters in other UI files ----------
+$fixPaths = @(
   "src\components\LiveTracker.js",
-  "src\app\backtest\page.js",
-  "src\app\page.js"
+  "src\app\page.js",
+  "src\app\backtest\page.js"
 ) | ForEach-Object { Join-Path $RepoRoot $_ }
 
-foreach ($p in $other) {
+foreach ($p in $fixPaths) {
   if (-not (Test-Path $p)) { continue }
   $orig = Get-Content -Path $p -Raw -Encoding UTF8
-  $fixed = Fix-Mojibake $orig
+  $fixed = Fix-WeirdText $orig
+
+  # Optional: also normalize a few common labels if they exist
+  $fixed = $fixed.Replace("Entry Price Range (0–1)", "Entry Price Range (0-1)")
+  $fixed = $fixed.Replace("Entry Price Range (0â€“1)", "Entry Price Range (0-1)")
+
   if ($fixed -ne $orig) {
     Backup-And-Write -Path $p -NewText $fixed
   } elseif ($DryRun) {
-    Write-Host "DRY RUN: No mojibake changes needed in $p"
+    Write-Host "DRY RUN: No changes needed in $p"
   }
 }
