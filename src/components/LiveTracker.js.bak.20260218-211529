@@ -32,9 +32,7 @@ export default function LiveTracker({ onSaveSession }) {
 
   const wsRef        = useRef(null);
   const tickRef      = useRef(null);   
-  const resTimeoutRef = useRef(null);
-const clockTickFnRef = useRef(null);
-const cdRef        = useRef(null);   
+  const cdRef        = useRef(null);   
   const marketRef    = useRef(null);
   const tokenRef     = useRef({ upId: null, downId: null });
   const pricesRef    = useRef({ up: null, down: null }); 
@@ -47,9 +45,7 @@ const cdRef        = useRef(null);
   const stopAll = useCallback(() => {
     clearInterval(tickRef.current);
     clearInterval(cdRef.current);
-    clearTimeout(resTimeoutRef.current);
-    resTimeoutRef.current = null;
-tickRef.current = null;
+    tickRef.current = null;
     cdRef.current   = null;
     if (wsRef.current) {
       wsRef.current.onclose = null; 
@@ -113,11 +109,7 @@ tickRef.current = null;
 
           setCurUp(pricesRef.current.up);
           setCurDown(pricesRef.current.down);
-                  const st = slugTsRef.current;
-          if (st != null && getSecondsRemaining(st) <= 0 && clockTickFnRef.current) {
-            clockTickFnRef.current();
-          }
-}
+        }
       } catch { /* ignore */ }
     };
 
@@ -197,23 +189,7 @@ tickRef.current = null;
     }
   }, [doSave, openWs]);
 
-  
-  useEffect(() => { clockTickFnRef.current = clockTick; }, [clockTick]);
-
-  const scheduleResolution = useCallback((slugTs) => {
-    clearTimeout(resTimeoutRef.current);
-    resTimeoutRef.current = null;
-    if (slugTs == null) return;
-    const ms = (getResolutionTs(slugTs) * 1000) - Date.now();
-    const wait = Math.max(0, ms + 25);
-    resTimeoutRef.current = setTimeout(() => {
-      if (slugTsRef.current !== slugTs) return;
-      if (savedRef.current) return;
-      if (clockTickFnRef.current) clockTickFnRef.current();
-    }, wait);
-  }, []);
-
-// -- main entry ----------------------------------------------------------
+  // -- main entry ----------------------------------------------------------
   const startTracking = useCallback(async (slugOverride, slugTsOverride) => {
     stopAll();
     setStatus("loading");
@@ -231,9 +207,7 @@ tickRef.current = null;
 
     const slugTs = slugTsOverride ?? getCurrentSlugTimestamp();
     slugTsRef.current = slugTs;
-    
-    scheduleResolution(slugTs);
-const slug = slugOverride ?? getMarketSlug(slugTs);
+    const slug = slugOverride ?? getMarketSlug(slugTs);
 
     setSlugLabel(slug);
     setManualSlug(slug);
@@ -281,7 +255,7 @@ const slug = slugOverride ?? getMarketSlug(slugTs);
 
     tickRef.current = setInterval(clockTick, 1000);
     clockTick(); 
-  }, [stopAll, openWs, clockTick, scheduleResolution]);
+  }, [stopAll, openWs, clockTick]);
 
   useEffect(() => { startFnRef.current = startTracking; }, [startTracking]);
   useEffect(() => { startTracking(); return stopAll; }, []); 
