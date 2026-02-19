@@ -84,7 +84,7 @@ const downloadSessionsSeparate = () => {
       )}
 
       <nav className="border-b border-[var(--border)] bg-[var(--nav)] backdrop-blur sticky top-0 z-10">
-        <div className="max-w-6xl mx-auto px-4 py-3 flex items-center gap-4">
+        <div className="max-w-5xl mx-auto px-4 py-3 flex items-center gap-4">
           <span className="font-bold text-lg">PM BTC 5m</span>
           <span className="text-[var(--text2)] text-sm hidden sm:block">Polymarket Tracker & Backtest</span>
           <div className="ml-auto flex gap-3 items-center">
@@ -95,7 +95,7 @@ const downloadSessionsSeparate = () => {
         </div>
       </nav>
 
-      <main className="max-w-6xl mx-auto px-4 py-6 space-y-6">
+      <main className="max-w-5xl mx-auto px-4 py-6 space-y-6">
         <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-5 shadow-sm">
           <h1 className="text-lg font-bold mb-4">Live Tracker</h1>
           <LiveTracker onSaveSession={onSaveSession} />
