@@ -408,41 +408,6 @@ export default function BacktestEngine({ sessions }) {
 
       {results && (
         <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-4 shadow-sm space-y-4">
-          <div className="bg-[var(--bg2)] border border-[var(--border)] rounded-xl p-3" style={{ height: chartHeight }}>
-            <p className="text-xs text-[var(--text2)] mb-2">
-              Top combos chart (metric: {results.chartRows?.[0]?.metricLabel ?? "Realized P/L"})
-            </p>
-            <ResponsiveContainer width="100%" height="92%">
-              <BarChart data={(results.chartRows ?? []).slice().reverse()} layout="vertical" margin={{ left: 10, right: 20, top: 10, bottom: 10 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-                <XAxis type="number" stroke="#94a3b8" tick={{ fontSize: 11 }} />
-                <YAxis type="category" dataKey="rowLabel" width={320} stroke="#94a3b8" tick={{ fontSize: 10 }} />
-                <Tooltip
-                  formatter={(v, n, ctx) => {
-                    const p = ctx?.payload;
-                    if (!p) return [v, n];
-                    return [
-                      `${p.metricLabel}=${p.metricVal}, winRate=${p.winRate}%, total=${p.total}, ROI=${p.realizedROI}%`,
-                      "Cell"
-                    ];
-                  }}
-                  contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 8 }}
-                />
-                <Bar dataKey="metricVal" radius={[4,4,4,4]}>
-                  {(results.chartRows ?? []).slice().reverse().map((r, i) => {
-                    const t = normalized.sortBy === "winrate"
-                      ? (r.winRate / 100)
-                      : normalized.sortBy === "roi"
-                        ? clamp((r.realizedROI + 50) / 100, 0, 1)
-                        : normalized.sortBy === "pl"
-                          ? clamp((r.realizedPL + 50) / 100, 0, 1)
-                          : 0.5;
-                    return <Cell key={i} fill={colorRamp(t)} />;
-                  })}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
 
           <div className="overflow-x-auto">
             <table className="w-full text-xs text-[var(--text1)]">
