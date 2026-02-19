@@ -45,6 +45,10 @@ $engineFiles | ForEach-Object { Write-Host " - $($_.FullName)" }
 $engineText = @'
 "use client";
 import { useMemo, useState } from "react";
+import {
+  BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid,
+  ResponsiveContainer, Cell
+} from "recharts";
 
 function clamp(n, lo, hi) {
   const x = Number(n);
@@ -74,10 +78,9 @@ function opposite(side) {
   return side === "UP" ? "DOWN" : "UP";
 }
 
-// Profit model (fees/slippage ignored):
-// stake = $10, buy at price p (0..1), shares = stake/p
-// if correct -> payout = shares*$1, profit = shares - stake
-// if wrong -> payout = $0, profit = -stake
+// stake = $10, buy at price p, shares=stake/p
+// if correct -> profit=shares - stake
+// if wrong -> profit=-stake
 function profitStats(stake, avgPrice01, winRate01) {
   const s = Math.max(0, Number(stake) || 0);
   const p = clamp(avgPrice01, 0.01, 0.99);
@@ -90,14 +93,28 @@ function profitStats(stake, avgPrice01, winRate01) {
   const expectedPL = (w * profitIfWin) + ((1 - w) * lossIfLose);
   const expectedROI = s > 0 ? (expectedPL / s) : 0;
 
-  return {
-    stake: s,
-    shares,
-    profitIfWin,
-    lossIfLose,
-    expectedPL,
-    expectedROI
-  };
+  return { stake: s, shares, profitIfWin, lossIfLose, expectedPL, expectedROI };
+}
+
+function colorForMetric(sortBy, value) {
+  // Return a readable red->yellow->green ramp
+  // winrate: center at 50, roi/pl: center at 0
+  let t = 0.5;
+  if (sortBy === "winrate") {
+    t = clamp(value / 100, 0, 1);
+  } else if (sortBy === "roi") {
+    // value is percent, map -100..+100 to 0..1
+    t = clamp((value + 100) / 200, 0, 1);
+  } else {
+    // pl: value in dollars, map -10..+50 to 0..1 (tune as needed)
+    t = clamp((value + 10) / 60, 0, 1);
+  }
+
+  // hue 0=red, 55=yellow, 120=green
+  const hue = (t < 0.5) ? (0 + (t / 0.5) * 55) : (55 + ((t - 0.5) / 0.5) * 65);
+  const sat = 70;
+  const light = 55;
+  return `hsl(${hue}, ${sat}%, ${light}%)`;
 }
 
 export default function BacktestEngine({ sessions }) {
@@ -170,11 +187,10 @@ export default function BacktestEngine({ sessions }) {
           const cent = clamp(Math.round(price * 100), 0, 100);
           if (cent < 1 || cent > 99) continue;
 
-          // Group price
           const centStart = (Math.floor((cent - 1) / normalized.ps) * normalized.ps) + 1;
           const centEnd = Math.min(99, centStart + normalized.ps - 1);
 
-          // Group time REMAINING (this is the requested switch for best-combos)
+          // Group time REMAINING
           const remStart = Math.floor(secRemaining / normalized.ts) * normalized.ts;
           const remEnd = Math.min(300, remStart + normalized.ts - 1);
 
@@ -207,7 +223,7 @@ export default function BacktestEngine({ sessions }) {
       return;
     }
 
-    const rows = [...cells.values()]
+    const allRows = [...cells.values()]
       .filter(x => x.total >= normalized.minSamples)
       .map(x => {
         const winRate01 = x.wins / x.total;
@@ -223,6 +239,14 @@ export default function BacktestEngine({ sessions }) {
           ? fmtMMSS(x.remStart)
           : `${fmtMMSS(x.remStart)}-${fmtMMSS(x.remEnd)}`;
 
+        const expectedPL = +pl.expectedPL.toFixed(2);
+        const expectedROI = +(pl.expectedROI * 100).toFixed(2);
+
+        let metricVal = winRatePct;
+        let metricLabel = "WinRate";
+        if (normalized.sortBy === "roi") { metricVal = expectedROI; metricLabel = "Exp ROI%"; }
+        if (normalized.sortBy === "pl") { metricVal = expectedPL; metricLabel = "Exp P/L"; }
+
         return {
           ...x,
           winRate01,
@@ -231,15 +255,18 @@ export default function BacktestEngine({ sessions }) {
           avgPriceLabel: fmtPrice01(avgPrice01),
           likelyOutcome,
           priceLabel,
-          timeLabel, // this is TIME REMAINING label
+          timeLabel,
           winTotal: `${x.wins}/${x.total}`,
           profitIfWin: +pl.profitIfWin.toFixed(2),
-          expectedPL: +pl.expectedPL.toFixed(2),
-          expectedROI: +(pl.expectedROI * 100).toFixed(2) // percent
+          expectedPL,
+          expectedROI,
+          metricVal,
+          metricLabel,
+          rowLabel: `${x.side} ${priceLabel} @ ${timeLabel}`
         };
       });
 
-    rows.sort((a, b) => {
+    allRows.sort((a, b) => {
       if (normalized.sortBy === "roi") {
         return (b.expectedROI - a.expectedROI) || (b.winRate - a.winRate) || (b.total - a.total);
       }
@@ -251,10 +278,15 @@ export default function BacktestEngine({ sessions }) {
 
     setResults({
       summary: { total: tradesCount, wins: winsCount, winRate: winsCount / tradesCount },
-      rows: rows.slice(0, normalized.topN),
+      rows: allRows.slice(0, normalized.topN),
+      chartRows: allRows.slice(0, Math.min(30, normalized.topN)),
       debug: { trades: tradesCount, cells: cells.size, priceStep: normalized.ps, timeStep: normalized.ts, sortBy: normalized.sortBy }
     });
   };
+
+  const chartHeight = results?.chartRows
+    ? Math.max(320, 120 + (results.chartRows.length * 18))
+    : 320;
 
   return (
     <div className="space-y-6">
@@ -299,7 +331,7 @@ export default function BacktestEngine({ sessions }) {
                 onChange={e => setElapsedMax(+e.target.value)}
                 className="w-24 bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-1.5 text-sm text-[var(--text1)]" />
             </div>
-            <p className="text-xs text-[var(--text3)] mt-1">Best-combos table uses time remaining (300 - elapsed).</p>
+            <p className="text-xs text-[var(--text3)] mt-1">Best-combos uses time remaining (300 - elapsed).</p>
           </div>
 
           <div>
@@ -379,40 +411,89 @@ export default function BacktestEngine({ sessions }) {
                     No rows. Lower Min samples, widen filters, and confirm sessions have outcomes.
                   </div>
                 ) : (
-                  <div className="overflow-x-auto">
-                    <table className="w-full text-xs text-[var(--text1)]">
-                      <thead>
-                        <tr className="text-[var(--text3)] border-b border-[var(--border)]">
-                          <th className="text-left py-1 pr-4">Side</th>
-                          <th className="text-right pr-4">Price bucket</th>
-                          <th className="text-right pr-4">Avg price</th>
-                          <th className="text-right pr-4">Time remaining</th>
-                          <th className="text-right pr-4">WinRate</th>
-                          <th className="text-right pr-4">Win/Total</th>
-                          <th className="text-right pr-4">ProfitIfWin</th>
-                          <th className="text-right pr-4">Exp P/L</th>
-                          <th className="text-right pr-4">Exp ROI%</th>
-                          <th className="text-right">Likely</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {results.rows.map((r, i) => (
-                          <tr key={i} className="border-b border-[var(--border)] hover:bg-[var(--bg2)]">
-                            <td className={`py-1 pr-4 font-bold ${r.side === "UP" ? "text-green-600" : "text-red-600"}`}>{r.side}</td>
-                            <td className="text-right pr-4">{r.priceLabel}</td>
-                            <td className="text-right pr-4">{r.avgPriceLabel}</td>
-                            <td className="text-right pr-4">{r.timeLabel}</td>
-                            <td className="text-right pr-4">{r.winRate}%</td>
-                            <td className="text-right pr-4">{r.winTotal}</td>
-                            <td className="text-right pr-4">${r.profitIfWin.toFixed(2)}</td>
-                            <td className={`text-right pr-4 font-bold ${r.expectedPL >= 0 ? "text-green-600" : "text-red-600"}`}>${r.expectedPL.toFixed(2)}</td>
-                            <td className={`text-right pr-4 font-bold ${r.expectedROI >= 0 ? "text-green-600" : "text-red-600"}`}>{r.expectedROI.toFixed(2)}%</td>
-                            <td className="text-right font-bold">{r.likelyOutcome}</td>
+                  <>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-xs text-[var(--text1)]">
+                        <thead>
+                          <tr className="text-[var(--text3)] border-b border-[var(--border)]">
+                            <th className="text-left py-1 pr-4">Side</th>
+                            <th className="text-right pr-4">Price bucket</th>
+                            <th className="text-right pr-4">Avg price</th>
+                            <th className="text-right pr-4">Time remaining</th>
+                            <th className="text-right pr-4">WinRate</th>
+                            <th className="text-right pr-4">Win/Total</th>
+                            <th className="text-right pr-4">ProfitIfWin</th>
+                            <th className="text-right pr-4">Exp P/L</th>
+                            <th className="text-right pr-4">Exp ROI%</th>
+                            <th className="text-right">Likely</th>
                           </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
+                        </thead>
+                        <tbody>
+                          {results.rows.map((r, i) => (
+                            <tr key={i} className="border-b border-[var(--border)] hover:bg-[var(--bg2)]">
+                              <td className={`py-1 pr-4 font-bold ${r.side === "UP" ? "text-green-600" : "text-red-600"}`}>{r.side}</td>
+                              <td className="text-right pr-4">{r.priceLabel}</td>
+                              <td className="text-right pr-4">{r.avgPriceLabel}</td>
+                              <td className="text-right pr-4">{r.timeLabel}</td>
+                              <td className="text-right pr-4">{r.winRate}%</td>
+                              <td className="text-right pr-4">{r.winTotal}</td>
+                              <td className="text-right pr-4">${r.profitIfWin.toFixed(2)}</td>
+                              <td className={`text-right pr-4 font-bold ${r.expectedPL >= 0 ? "text-green-600" : "text-red-600"}`}>${r.expectedPL.toFixed(2)}</td>
+                              <td className={`text-right pr-4 font-bold ${r.expectedROI >= 0 ? "text-green-600" : "text-red-600"}`}>{r.expectedROI.toFixed(2)}%</td>
+                              <td className="text-right font-bold">{r.likelyOutcome}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+
+                    {/* Colorful chart (easier to read) */}
+                    <div className="mt-4 bg-[var(--bg2)] border border-[var(--border)] rounded-xl p-3" style={{ height: chartHeight }}>
+                      <p className="text-xs text-[var(--text2)] mb-2">
+                        Top combos chart (metric: {results.chartRows?.[0]?.metricLabel ?? "WinRate"})
+                      </p>
+
+                      <ResponsiveContainer width="100%" height="92%">
+                        <BarChart data={(results.chartRows ?? []).slice().reverse()} layout="vertical" margin={{ left: 10, right: 20, top: 10, bottom: 10 }}>
+                          <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+                          <XAxis
+                            type="number"
+                            stroke="#94a3b8"
+                            tick={{ fontSize: 11 }}
+                            tickFormatter={(v) => {
+                              if (normalized.sortBy === "winrate") return `${v}%`;
+                              if (normalized.sortBy === "roi") return `${v}%`;
+                              return `$${v}`;
+                            }}
+                          />
+                          <YAxis
+                            type="category"
+                            dataKey="rowLabel"
+                            width={260}
+                            stroke="#94a3b8"
+                            tick={{ fontSize: 10 }}
+                          />
+                          <Tooltip
+                            formatter={(v, n, ctx) => {
+                              const p = ctx?.payload;
+                              if (!p) return [v, n];
+                              const metric = p.metricLabel || "Metric";
+                              return [
+                                `${metric}=${p.metricVal}, winRate=${p.winRate}%, win/total=${p.winTotal}, expPL=$${p.expectedPL}, expROI=${p.expectedROI}%`,
+                                "Combo"
+                              ];
+                            }}
+                            contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 8 }}
+                          />
+                          <Bar dataKey="metricVal" radius={[4,4,4,4]}>
+                            {(results.chartRows ?? []).slice().reverse().map((e, i) => (
+                              <Cell key={i} fill={colorForMetric(normalized.sortBy, e.metricVal)} />
+                            ))}
+                          </Bar>
+                        </BarChart>
+                      </ResponsiveContainer>
+                    </div>
+                  </>
                 )}
 
                 <div className="text-xs text-[var(--text3)] mt-3">
@@ -441,7 +522,7 @@ function SCard({ label, value, color }) {
 }
 '@
 
-# Guard: ensure ASCII-only JS to avoid mojibake/encoding issues
+# Guard: keep ASCII-only JS (prevents encoding/mystery characters)
 foreach ($ch in $engineText.ToCharArray()) {
   if ([int][char]$ch -gt 127) { throw "BacktestEngine.js content contains non-ASCII; aborting." }
 }
@@ -461,8 +542,8 @@ foreach ($f in $engineFiles) {
 if (-not $DryRun) {
   foreach ($f in $engineFiles) {
     $t = [System.IO.File]::ReadAllText($f.FullName, [System.Text.Encoding]::UTF8)
-    if ($t -notmatch 'time remaining' -or $t -notmatch 'priceStepCents' -or $t -notmatch 'timeStepSecs' -or $t -notmatch 'Win/Total' -or $t -notmatch 'Expected ROI') {
-      throw "Verification failed for $($f.FullName): markers missing."
+    if ($t -notmatch 'Top combos chart' -or $t -notmatch 'colorForMetric' -or $t -notmatch 'metricVal') {
+      throw "Verification failed for $($f.FullName): chart markers missing."
     }
     Write-Host "Verified: $($f.FullName)"
   }
