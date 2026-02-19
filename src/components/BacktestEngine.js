@@ -1,9 +1,5 @@
 "use client";
 import { useMemo, useState } from "react";
-import {
-  BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid,
-  ResponsiveContainer, Cell
-} from "recharts";
 
 function clamp(n, lo, hi) {
   const x = Number(n);
@@ -27,26 +23,6 @@ function opposite(side) {
   return side === "UP" ? "DOWN" : "UP";
 }
 
-function plForStake(stake, price01, winRate01) {
-  const p = clamp(price01, 0.01, 0.99);
-  const stakeClamped = Math.max(0, Number(stake) || 0);
-  const shares = stakeClamped / p;
-
-  const profitIfWin = shares - stakeClamped; // payout = shares * $1, cost = stake
-  const lossIfLose = -stakeClamped;
-
-  const w = clamp(winRate01, 0, 1);
-  const expectedPL = (w * profitIfWin) + ((1 - w) * lossIfLose);
-
-  return {
-    stake: stakeClamped,
-    shares,
-    profitIfWin,
-    lossIfLose,
-    expectedPL
-  };
-}
-
 export default function BacktestEngine({ sessions }) {
   // Defaults requested
   const [buySide, setBuySide] = useState("BOTH"); // UP, DOWN, BOTH
@@ -55,11 +31,9 @@ export default function BacktestEngine({ sessions }) {
   const [elapsedMin, setElapsedMin] = useState(0);
   const [elapsedMax, setElapsedMax] = useState(300);
 
-  // Output controls
-  const [rankSide, setRankSide] = useState("BOTH"); // UP, DOWN, BOTH
-  const [topN, setTopN] = useState(30);
-  const [minSamples, setMinSamples] = useState(10);
-  const [stake, setStake] = useState(10);
+  // Make it easy to actually see rows
+  const [topN, setTopN] = useState(50);
+  const [minSamples, setMinSamples] = useState(1); // important: default low so table is not empty
 
   const [results, setResults] = useState(null);
 
@@ -70,14 +44,14 @@ export default function BacktestEngine({ sessions }) {
     const eMax = clamp(Math.max(elapsedMin, elapsedMax), 0, 300);
     return {
       pMin, pMax, eMin, eMax,
-      topN: clamp(topN, 5, 200),
-      minSamples: clamp(minSamples, 1, 1000000),
-      stake: Math.max(0, Number(stake) || 0)
+      topN: clamp(topN, 1, 500),
+      minSamples: clamp(minSamples, 1, 1000000)
     };
-  }, [priceMin, priceMax, elapsedMin, elapsedMax, topN, minSamples, stake]);
+  }, [priceMin, priceMax, elapsedMin, elapsedMax, topN, minSamples]);
 
   const runBacktest = () => {
     const sides = buySide === "BOTH" ? ["UP", "DOWN"] : [buySide];
+
     const trades = [];
     const comboBySide = { UP: new Map(), DOWN: new Map() }; // key = sec*100 + cent
 
@@ -85,7 +59,8 @@ export default function BacktestEngine({ sessions }) {
       const outcome = session?.outcome;
       if (!outcome) continue;
 
-      for (const point of session.priceHistory ?? []) {
+      const points = Array.isArray(session?.priceHistory) ? session.priceHistory : [];
+      for (const point of points) {
         const el = point?.elapsed ?? 0;
         if (el < normalized.eMin || el > normalized.eMax) continue;
 
@@ -112,60 +87,41 @@ export default function BacktestEngine({ sessions }) {
     }
 
     if (!trades.length) {
-      setResults({ summary: null, bestCombos: [], comboBySide });
+      setResults({ summary: null, bestCombos: [], debug: { combos: 0, trades: 0 } });
       return;
     }
 
     const totalWins = trades.reduce((acc, t) => acc + (t.win ? 1 : 0), 0);
     const overallWr = totalWins / trades.length;
 
-    let pool = [];
-    if (rankSide === "BOTH") pool = [...comboBySide.UP.values(), ...comboBySide.DOWN.values()];
-    else pool = [...comboBySide[rankSide].values()];
+    const pool = [...comboBySide.UP.values(), ...comboBySide.DOWN.values()];
 
     const bestCombos = pool
       .filter(x => x.total >= normalized.minSamples)
       .map(x => {
         const winRate01 = x.wins / x.total;
-        const winRatePct = winRate01 * 100;
+        const winRate = winRate01 * 100;
         const price01 = x.cent / 100;
-
-        const pl = plForStake(normalized.stake, price01, winRate01);
         const likelyOutcome = (winRate01 >= 0.5) ? x.side : opposite(x.side);
-
-        const label = (rankSide === "BOTH")
-          ? `${x.side} ${fmtPrice01(price01)} @ ${fmtTime(x.sec)}`
-          : `${fmtPrice01(price01)} @ ${fmtTime(x.sec)}`;
-
         return {
-          label,
           side: x.side,
+          price01,
           sec: x.sec,
-          cent: x.cent,
           wins: x.wins,
           total: x.total,
-          winRate: +winRatePct.toFixed(1),
+          winRate: +winRate.toFixed(1),
           likelyOutcome,
-          stake: pl.stake,
-          shares: +pl.shares.toFixed(2),
-          profitIfWin: +pl.profitIfWin.toFixed(2),
-          lossIfLose: +pl.lossIfLose.toFixed(2),
-          expectedPL: +pl.expectedPL.toFixed(2)
         };
       })
-      .sort((a, b) => (b.winRate - a.winRate) || (b.total - a.total) || (a.sec - b.sec) || (a.cent - b.cent))
+      .sort((a, b) => (b.winRate - a.winRate) || (b.total - a.total) || (a.sec - b.sec) || (a.price01 - b.price01))
       .slice(0, normalized.topN);
 
     setResults({
       summary: { total: trades.length, wins: totalWins, winRate: overallWr },
       bestCombos,
-      comboBySide
+      debug: { combos: pool.length, trades: trades.length }
     });
   };
-
-  const chartHeight = results?.bestCombos
-    ? Math.max(520, 190 + (results.bestCombos.length * 18))
-    : 520;
 
   return (
     <div className="space-y-6">
@@ -180,18 +136,6 @@ export default function BacktestEngine({ sessions }) {
                 <button key={s} onClick={() => setBuySide(s)}
                   className={`flex-1 py-2 rounded-lg font-bold text-sm transition ${
                     buySide === s ? "bg-indigo-600 text-white" : "bg-[var(--bg2)] hover:bg-[var(--bg3)] text-[var(--text1)] border border-[var(--border)]"
-                  }`}>{s}</button>
-              ))}
-            </div>
-          </div>
-
-          <div>
-            <label className="text-xs text-[var(--text2)] block mb-1">Rank combos for</label>
-            <div className="flex gap-2">
-              {["UP","DOWN","BOTH"].map(s => (
-                <button key={s} onClick={() => setRankSide(s)}
-                  className={`flex-1 py-2 rounded-lg font-bold text-sm transition ${
-                    rankSide === s ? "bg-indigo-600 text-white" : "bg-[var(--bg2)] hover:bg-[var(--bg3)] text-[var(--text1)] border border-[var(--border)]"
                   }`}>{s}</button>
               ))}
             </div>
@@ -225,27 +169,18 @@ export default function BacktestEngine({ sessions }) {
           </div>
 
           <div>
-            <label className="text-xs text-[var(--text2)] block mb-1">Stake ($) for P/L simulation</label>
-            <input type="number" min="0" step="1" value={stake}
-              onChange={e => setStake(+e.target.value)}
-              className="w-full bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-2 text-sm text-[var(--text1)]" />
-            <p className="text-xs text-[var(--text3)] mt-1">
-              Assumes $1 payout per share if correct, $0 if wrong (fees/slippage ignored).
-            </p>
-          </div>
-
-          <div>
-            <label className="text-xs text-[var(--text2)] block mb-1">Top N combos</label>
-            <input type="number" min="5" max="200" step="1" value={topN}
+            <label className="text-xs text-[var(--text2)] block mb-1">Top N rows</label>
+            <input type="number" min="1" max="500" step="1" value={topN}
               onChange={e => setTopN(+e.target.value)}
               className="w-full bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-2 text-sm text-[var(--text1)]" />
           </div>
 
           <div>
-            <label className="text-xs text-[var(--text2)] block mb-1">Min samples per combo (n)</label>
+            <label className="text-xs text-[var(--text2)] block mb-1">Min samples per (price,time) cell</label>
             <input type="number" min="1" step="1" value={minSamples}
               onChange={e => setMinSamples(+e.target.value)}
               className="w-full bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-2 text-sm text-[var(--text1)]" />
+            <p className="text-xs text-[var(--text3)] mt-1">If your table is empty, lower this.</p>
           </div>
         </div>
 
@@ -255,78 +190,68 @@ export default function BacktestEngine({ sessions }) {
         </button>
       </div>
 
-      {results && results.summary && (
+      {results && (
         <div className="space-y-4">
-          <div className="grid grid-cols-3 gap-3">
-            <SCard label="Total Trades" value={results.summary.total} color="text-blue-600 dark:text-blue-400" />
-            <SCard label="Wins" value={results.summary.wins} color="text-green-600 dark:text-green-400" />
-            <SCard
-              label="Win Rate"
-              value={`${(results.summary.winRate * 100).toFixed(1)}%`}
-              color={results.summary.winRate >= 0.5 ? "text-green-600 dark:text-green-400" : "text-red-600 dark:text-red-400"}
-            />
-          </div>
-
-          <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-4 shadow-sm" style={{ height: chartHeight }}>
-            <p className="text-sm font-bold mb-2">Best price+time combos (sorted by win rate, high to low)</p>
-            <ResponsiveContainer width="100%" height="92%">
-              <BarChart data={results.bestCombos} layout="vertical" margin={{ left: 20, right: 20, top: 10, bottom: 10 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-                <XAxis type="number" domain={[0, 100]} tickFormatter={(v) => `${v}%`} stroke="#94a3b8" tick={{ fontSize: 11 }} />
-                <YAxis type="category" dataKey="label" width={260} stroke="#94a3b8" tick={{ fontSize: 11 }} />
-                <Tooltip
-                  formatter={(v, n, ctx) => {
-                    const p = ctx?.payload;
-                    if (!p) return [v, n];
-                    return [
-                      `winRate=${p.winRate}%, n=${p.total}, stake=$${p.stake}, profitIfWin=$${p.profitIfWin}, lossIfLose=$${p.lossIfLose}, expectedPL=$${p.expectedPL}, likelyOutcome=${p.likelyOutcome}`,
-                      "Combo"
-                    ];
-                  }}
-                  contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 8 }}
+          {results.summary ? (
+            <>
+              <div className="grid grid-cols-3 gap-3">
+                <SCard label="Total Trades" value={results.summary.total} color="text-blue-600 dark:text-blue-400" />
+                <SCard label="Wins" value={results.summary.wins} color="text-green-600 dark:text-green-400" />
+                <SCard
+                  label="Win Rate"
+                  value={`${(results.summary.winRate * 100).toFixed(1)}%`}
+                  color={results.summary.winRate >= 0.5 ? "text-green-600 dark:text-green-400" : "text-red-600 dark:text-red-400"}
                 />
-                <Bar dataKey="winRate" radius={[4,4,4,4]}>
-                  {results.bestCombos.map((e, i) => (
-                    <Cell key={i} fill={e.winRate >= 50 ? "#16a34a" : "#dc2626"} />
-                  ))}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
+              </div>
 
-          <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-4 shadow-sm">
-            <p className="text-xs text-[var(--text2)] mb-3">P/L simulation for the ranked combos</p>
-            <div className="overflow-x-auto">
-              <table className="w-full text-xs text-[var(--text1)]">
-                <thead>
-                  <tr className="text-[var(--text3)] border-b border-[var(--border)]">
-                    <th className="text-left py-1 pr-4">Combo</th>
-                    <th className="text-right pr-4">WinRate</th>
-                    <th className="text-right pr-4">n</th>
-                    <th className="text-right pr-4">Stake</th>
-                    <th className="text-right pr-4">ProfitIfWin</th>
-                    <th className="text-right pr-4">LossIfLose</th>
-                    <th className="text-right">ExpectedPL</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {results.bestCombos.map((c, i) => (
-                    <tr key={i} className="border-b border-[var(--border)] hover:bg-[var(--bg2)]">
-                      <td className="py-1 pr-4">{c.label}</td>
-                      <td className="text-right pr-4">{c.winRate}%</td>
-                      <td className="text-right pr-4">{c.total}</td>
-                      <td className="text-right pr-4">${c.stake.toFixed(0)}</td>
-                      <td className="text-right pr-4">${c.profitIfWin.toFixed(2)}</td>
-                      <td className="text-right pr-4">${c.lossIfLose.toFixed(2)}</td>
-                      <td className={`text-right font-bold ${c.expectedPL >= 0 ? "text-green-600" : "text-red-600"}`}>
-                        ${c.expectedPL.toFixed(2)}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+              <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-4 shadow-sm">
+                <p className="text-sm font-bold mb-2">Best price + time combos (table, sorted by win rate)</p>
+
+                {results.bestCombos.length === 0 ? (
+                  <div className="text-sm text-[var(--text3)]">
+                    No rows. Try: set Min samples to 1, widen filters, or confirm sessions have outcomes.
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-xs text-[var(--text1)]">
+                      <thead>
+                        <tr className="text-[var(--text3)] border-b border-[var(--border)]">
+                          <th className="text-left py-1 pr-4">Side</th>
+                          <th className="text-right pr-4">Price</th>
+                          <th className="text-right pr-4">Elapsed</th>
+                          <th className="text-right pr-4">WinRate</th>
+                          <th className="text-right pr-4">Wins</th>
+                          <th className="text-right pr-4">N</th>
+                          <th className="text-right">Likely outcome</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {results.bestCombos.map((r, i) => (
+                          <tr key={i} className="border-b border-[var(--border)] hover:bg-[var(--bg2)]">
+                            <td className={`py-1 pr-4 font-bold ${r.side === "UP" ? "text-green-600" : "text-red-600"}`}>{r.side}</td>
+                            <td className="text-right pr-4">{fmtPrice01(r.price01)}</td>
+                            <td className="text-right pr-4">{fmtTime(r.sec)}</td>
+                            <td className="text-right pr-4">{r.winRate}%</td>
+                            <td className="text-right pr-4">{r.wins}</td>
+                            <td className="text-right pr-4">{r.total}</td>
+                            <td className="text-right font-bold">{r.likelyOutcome}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+
+                <div className="text-xs text-[var(--text3)] mt-3">
+                  Debug: combos scanned={results.debug?.combos ?? 0}, trades={results.debug?.trades ?? 0}
+                </div>
+              </div>
+            </>
+          ) : (
+            <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-6 text-center text-[var(--text3)]">
+              No matching trades.
             </div>
-          </div>
+          )}
         </div>
       )}
     </div>
