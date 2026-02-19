@@ -1,14 +1,14 @@
-<# patch-backtest-apply.ps1
-   Self-checking patch:
-   - Finds repo root by locating package.json (walks upward)
-   - Finds BacktestEngine.js in repo (prefers src/components/BacktestEngine.js)
-   - Overwrites it with "best combos + what-if" version, default price range 0.01..0.99
-   - Fixes mojibake/weird chars in common UI files (ASCII only)
-   - Writes UTF-8 (no BOM), makes timestamped backups, and verifies the change
+<# a.ps1
+   Fixes:
+   - Default Entry Price Range to 0.01..0.99
+   - Adds optimal Price+Time chart sorted by win rate (highest->lowest)
+   - Adds what-if lookup (buy UP/DOWN at price+time -> win rate + likely outcome)
+   - Removes mojibake/weird characters (ASCII-only) across src
+   - Patches ALL copies of BacktestEngine.js to avoid "wrong file" problems
+   - Verifies patch applied
 
-   Usage (recommended):
-     powershell -ExecutionPolicy Bypass -File .\patch-backtest-apply.ps1
-     powershell -ExecutionPolicy Bypass -File .\patch-backtest-apply.ps1 -RepoRoot "C:\path\to\repo"
+   Run:
+     powershell -ExecutionPolicy Bypass -File .\a.ps1
 #>
 
 param(
@@ -22,22 +22,26 @@ function Write-Utf8NoBom([string]$Path, [string]$Text) {
 }
 
 function Backup-And-Write([string]$Path, [string]$NewText) {
-  if ($DryRun) {
-    Write-Host "DRY RUN: Would write $Path"
-    return $true
-  }
-
+  if ($DryRun) { Write-Host "DRY RUN: Would write $Path"; return }
   $backup = "$Path.bak.$(Get-Date -Format yyyyMMdd-HHmmss)"
   Copy-Item -Path $Path -Destination $backup -Force
   Write-Utf8NoBom -Path $Path -Text $NewText
-
   Write-Host "Patched: $Path"
   Write-Host "Backup : $backup"
-  return $true
+}
+
+function Find-RepoRoot([string]$StartDir) {
+  $dir = (Resolve-Path $StartDir).Path
+  while ($true) {
+    if (Test-Path (Join-Path $dir "package.json")) { return $dir }
+    $parent = Split-Path $dir -Parent
+    if ($parent -eq $dir -or [string]::IsNullOrWhiteSpace($parent)) { return $null }
+    $dir = $parent
+  }
 }
 
 function Fix-WeirdText([string]$Text) {
-  # Mojibake -> ASCII (plus a few non-ASCII -> ASCII)
+  # Mojibake + weird symbols -> ASCII
   $map = [ordered]@{
     "Ã—"  = "x"
     "â€“" = "-"
@@ -51,7 +55,7 @@ function Fix-WeirdText([string]$Text) {
     "Â "  = " "
     "Â·"  = " - "
     "Â¢"  = "c"
-    "â—" = "*"   # WS dot mojibake
+    "â—" = "*"
     "â—‹" = "o"
     "â–²" = "^"
     "â–¼" = "v"
@@ -65,63 +69,50 @@ function Fix-WeirdText([string]$Text) {
   return $Text
 }
 
-function Find-RepoRoot([string]$StartDir) {
-  $dir = (Resolve-Path $StartDir).Path
-  while ($true) {
-    if (Test-Path (Join-Path $dir "package.json")) { return $dir }
-    $parent = Split-Path $dir -Parent
-    if ($parent -eq $dir -or [string]::IsNullOrWhiteSpace($parent)) { return $null }
-    $dir = $parent
-  }
-}
-
-function Find-BacktestEngine([string]$Root) {
-  $preferred = Join-Path $Root "src\components\BacktestEngine.js"
-  if (Test-Path $preferred) { return $preferred }
-
-  $candidates = Get-ChildItem -Path $Root -Recurse -File -Filter "BacktestEngine.js" -ErrorAction SilentlyContinue
-  if ($candidates.Count -eq 1) { return $candidates[0].FullName }
-
-  # Fallback: find by content
-  foreach ($f in $candidates) {
-    try {
-      $t = Get-Content -Path $f.FullName -Raw -Encoding UTF8
-      if ($t -match 'export\s+default\s+function\s+BacktestEngine') { return $f.FullName }
-    } catch {}
-  }
-  return $null
-}
-
 # --- Resolve repo root ---
 if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
-  $RepoRoot = Find-RepoRoot -StartDir (Get-Location).Path
+  $RepoRoot = Find-RepoRoot (Get-Location).Path
 } else {
-  $RepoRoot = Find-RepoRoot -StartDir $RepoRoot
+  $RepoRoot = Find-RepoRoot $RepoRoot
 }
-
-if (-not $RepoRoot) {
-  Write-Error "Could not locate repo root (package.json). Run from repo root or pass -RepoRoot C:\path\to\repo."
-  exit 1
-}
+if (-not $RepoRoot) { throw "Could not find repo root (package.json). Run from repo root or pass -RepoRoot." }
 
 Write-Host "RepoRoot: $RepoRoot"
 
-# --- Locate BacktestEngine.js ---
-$enginePath = Find-BacktestEngine -Root $RepoRoot
-if (-not $enginePath) {
-  Write-Error "Could not find BacktestEngine.js under $RepoRoot"
-  exit 1
+# --- 1) Repo-wide weird character cleanup under src (optional but recommended) ---
+$srcDir = Join-Path $RepoRoot "src"
+if (Test-Path $srcDir) {
+  $allJs = Get-ChildItem -Path $srcDir -Recurse -File -Include *.js,*.jsx,*.ts,*.tsx -ErrorAction SilentlyContinue
+  foreach ($f in $allJs) {
+    try {
+      $orig = Get-Content -Path $f.FullName -Raw -Encoding UTF8
+      $fixed = Fix-WeirdText $orig
+      if ($fixed -ne $orig) {
+        if ($DryRun) { Write-Host "DRY RUN: Would normalize text in $($f.FullName)"; continue }
+        $backup = "$($f.FullName).bak.$(Get-Date -Format yyyyMMdd-HHmmss)"
+        Copy-Item $f.FullName $backup -Force
+        Write-Utf8NoBom $f.FullName $fixed
+        Write-Host "Normalized text: $($f.FullName)"
+      }
+    } catch {}
+  }
+} else {
+  Write-Host "WARNING: src/ not found. Skipping repo-wide text normalization."
 }
 
-Write-Host "BacktestEngine: $enginePath"
+# --- 2) Patch ALL BacktestEngine.js copies ---
+$engineFiles = Get-ChildItem -Path $RepoRoot -Recurse -File -Filter "BacktestEngine.js" -ErrorAction SilentlyContinue
+if (-not $engineFiles -or $engineFiles.Count -eq 0) { throw "Could not find any BacktestEngine.js in repo." }
 
-# --- New BacktestEngine content (ASCII-only UI) ---
+Write-Host "Found BacktestEngine.js files:"
+$engineFiles | ForEach-Object { Write-Host " - $($_.FullName)" }
+
 $engineNew = @'
 "use client";
 import { useMemo, useState } from "react";
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid,
-  ResponsiveContainer, Cell,
+  ResponsiveContainer, Cell
 } from "recharts";
 
 function clamp(n, lo, hi) {
@@ -142,19 +133,19 @@ function fmtTime(sec) {
 }
 
 export default function BacktestEngine({ sessions }) {
-  // Defaults per request
+  // Defaults requested: 0.01..0.99
   const [buySide, setBuySide] = useState("BOTH"); // UP, DOWN, BOTH
   const [priceMin, setPriceMin] = useState(0.01);
   const [priceMax, setPriceMax] = useState(0.99);
   const [elapsedMin, setElapsedMin] = useState(0);
   const [elapsedMax, setElapsedMax] = useState(300);
 
-  // Rank settings
+  // Ranking output: best (side + price + time) combos
   const [rankSide, setRankSide] = useState("BOTH"); // UP, DOWN, BOTH
   const [topN, setTopN] = useState(30);
   const [minSamples, setMinSamples] = useState(10);
 
-  // What-if
+  // What-if query
   const [qSide, setQSide] = useState("UP");
   const [qPrice, setQPrice] = useState(0.60);
   const [qElapsed, setQElapsed] = useState(120);
@@ -169,16 +160,14 @@ export default function BacktestEngine({ sessions }) {
     return {
       pMin, pMax, eMin, eMax,
       topN: clamp(topN, 5, 200),
-      minSamples: clamp(minSamples, 1, 1000000),
+      minSamples: clamp(minSamples, 1, 1000000)
     };
   }, [priceMin, priceMax, elapsedMin, elapsedMax, topN, minSamples]);
 
   const runBacktest = () => {
     const sides = buySide === "BOTH" ? ["UP", "DOWN"] : [buySide];
     const trades = [];
-
-    // Store exact (sec, cent) stats per side
-    const comboBySide = { UP: new Map(), DOWN: new Map() }; // key = sec*100 + cent
+    const comboBySide = { UP: new Map(), DOWN: new Map() }; // key=sec*100+cent
 
     for (const session of sessions) {
       const outcome = session?.outcome;
@@ -190,7 +179,7 @@ export default function BacktestEngine({ sessions }) {
         if (el < normalized.eMin || el > normalized.eMax) continue;
 
         for (const s of sides) {
-          const price = s === "DOWN" ? point?.down : point?.up;
+          const price = (s === "DOWN") ? point?.down : point?.up;
           if (price == null) continue;
           if (price < normalized.pMin || price > normalized.pMax) continue;
 
@@ -199,15 +188,7 @@ export default function BacktestEngine({ sessions }) {
           if (cent < 1 || cent > 99) continue;
 
           const win = outcome === s;
-
-          trades.push({
-            slug: session?.slug ?? "?",
-            elapsed: sec,
-            price,
-            side: s,
-            outcome,
-            win,
-          });
+          trades.push({ slug: session?.slug ?? "?", sec, cent, side: s, outcome, win });
 
           const key = (sec * 100) + cent;
           const m = comboBySide[s];
@@ -220,19 +201,16 @@ export default function BacktestEngine({ sessions }) {
     }
 
     if (!trades.length) {
-      setResults({ trades: [], summary: null, bestCombos: [], comboBySide });
+      setResults({ summary: null, bestCombos: [], comboBySide });
       return;
     }
 
-    const wins = trades.reduce((acc, t) => acc + (t.win ? 1 : 0), 0);
-    const winRate = wins / trades.length;
+    const totalWins = trades.reduce((acc, t) => acc + (t.win ? 1 : 0), 0);
+    const overallWr = totalWins / trades.length;
 
     let pool = [];
-    if (rankSide === "BOTH") {
-      pool = [...comboBySide.UP.values(), ...comboBySide.DOWN.values()];
-    } else {
-      pool = [...comboBySide[rankSide].values()];
-    }
+    if (rankSide === "BOTH") pool = [...comboBySide.UP.values(), ...comboBySide.DOWN.values()];
+    else pool = [...comboBySide[rankSide].values()];
 
     const bestCombos = pool
       .filter(x => x.total >= normalized.minSamples)
@@ -247,11 +225,9 @@ export default function BacktestEngine({ sessions }) {
       .slice(0, normalized.topN);
 
     setResults({
-      trades,
-      summary: { total: trades.length, wins, winRate },
+      summary: { total: trades.length, wins: totalWins, winRate: overallWr },
       bestCombos,
-      comboBySide,
-      params: { ...normalized, buySide, rankSide },
+      comboBySide
     });
   };
 
@@ -261,17 +237,11 @@ export default function BacktestEngine({ sessions }) {
     const side = qSide;
     const sec = clamp(Math.round(qElapsed), 0, 300);
     const cent = clamp(Math.round(clamp(qPrice, 0, 1) * 100), 0, 100);
-
-    if (cent < 1 || cent > 99) {
-      return { ok: false, msg: "Price must be between 0.01 and 0.99 (after rounding)." };
-    }
+    if (cent < 1 || cent > 99) return { ok: false, msg: "Pick a price that rounds to 0.01 - 0.99." };
 
     const key = (sec * 100) + cent;
     const cell = results.comboBySide[side].get(key);
-
-    if (!cell || !cell.total) {
-      return { ok: false, msg: "No samples for that exact price+time. Try a nearby value or widen filters." };
-    }
+    if (!cell || !cell.total) return { ok: false, msg: "No samples for that exact price+time." };
 
     const wr = (cell.wins / cell.total) * 100;
     const likelyOutcome = (wr >= 50) ? side : (side === "UP" ? "DOWN" : "UP");
@@ -284,7 +254,7 @@ export default function BacktestEngine({ sessions }) {
       winRate: +wr.toFixed(1),
       wins: cell.wins,
       total: cell.total,
-      likelyOutcome,
+      likelyOutcome
     };
   }, [results, qSide, qPrice, qElapsed]);
 
@@ -300,7 +270,7 @@ export default function BacktestEngine({ sessions }) {
               {["UP","DOWN","BOTH"].map(s => (
                 <button key={s} onClick={() => setBuySide(s)}
                   className={`flex-1 py-2 rounded-lg font-bold text-sm transition ${
-                    buySide===s ? "bg-indigo-600 text-white" : "bg-[var(--bg2)] hover:bg-[var(--bg3)] text-[var(--text1)] border border-[var(--border)]"
+                    buySide === s ? "bg-indigo-600 text-white" : "bg-[var(--bg2)] hover:bg-[var(--bg3)] text-[var(--text1)] border border-[var(--border)]"
                   }`}>{s}</button>
               ))}
             </div>
@@ -312,7 +282,7 @@ export default function BacktestEngine({ sessions }) {
               {["UP","DOWN","BOTH"].map(s => (
                 <button key={s} onClick={() => setRankSide(s)}
                   className={`flex-1 py-2 rounded-lg font-bold text-sm transition ${
-                    rankSide===s ? "bg-indigo-600 text-white" : "bg-[var(--bg2)] hover:bg-[var(--bg3)] text-[var(--text1)] border border-[var(--border)]"
+                    rankSide === s ? "bg-indigo-600 text-white" : "bg-[var(--bg2)] hover:bg-[var(--bg3)] text-[var(--text1)] border border-[var(--border)]"
                   }`}>{s}</button>
               ))}
             </div>
@@ -420,7 +390,7 @@ export default function BacktestEngine({ sessions }) {
                   <BarChart data={results.bestCombos} layout="vertical" margin={{ left: 20, right: 20, top: 10, bottom: 10 }}>
                     <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
                     <XAxis type="number" domain={[0, 100]} tickFormatter={(v) => `${v}%`} stroke="#94a3b8" tick={{ fontSize: 11 }} />
-                    <YAxis type="category" dataKey="label" width={190} stroke="#94a3b8" tick={{ fontSize: 11 }} />
+                    <YAxis type="category" dataKey="label" width={210} stroke="#94a3b8" tick={{ fontSize: 11 }} />
                     <Tooltip
                       formatter={(v, n, ctx) => {
                         const p = ctx?.payload;
@@ -460,39 +430,20 @@ function SCard({ label, value, color }) {
 '@
 
 $engineNew = Fix-WeirdText $engineNew
-Backup-And-Write -Path $enginePath -NewText $engineNew | Out-Null
 
-# Verify write worked (marker strings must exist)
+foreach ($f in $engineFiles) {
+  Backup-And-Write $f.FullName $engineNew
+}
+
+# --- 3) Verify patch markers exist in each BacktestEngine.js ---
 if (-not $DryRun) {
-  $verify = Get-Content -Path $enginePath -Raw -Encoding UTF8
-  if (($verify -notmatch 'useState\(0\.01\)') -or ($verify -notmatch 'Best price\+time combos')) {
-    Write-Error "Patch verification failed: file did not contain expected markers after write."
-    exit 1
-  }
-  Write-Host "Verified: BacktestEngine.js updated successfully."
-}
-
-# --- Fix weird characters in other UI files ---
-$uiPaths = @(
-  "src\components\LiveTracker.js",
-  "src\app\page.js",
-  "src\app\backtest\page.js"
-) | ForEach-Object { Join-Path $RepoRoot $_ }
-
-foreach ($p in $uiPaths) {
-  if (-not (Test-Path $p)) { continue }
-  $orig = Get-Content -Path $p -Raw -Encoding UTF8
-  $fixed = Fix-WeirdText $orig
-
-  # Force common label normalization if present
-  $fixed = $fixed.Replace("Entry Price Range (0–1)", "Entry Price Range (0-1)")
-  $fixed = $fixed.Replace("Entry Price Range (0â€“1)", "Entry Price Range (0-1)")
-
-  if ($fixed -ne $orig) {
-    Backup-And-Write -Path $p -NewText $fixed | Out-Null
-  } elseif ($DryRun) {
-    Write-Host "DRY RUN: No changes needed in $p"
+  foreach ($f in $engineFiles) {
+    $t = Get-Content -Path $f.FullName -Raw -Encoding UTF8
+    if (($t -notmatch 'useState\(0\.01\)') -or ($t -notmatch 'Best price\+time combos')) {
+      throw "Verification failed for: $($f.FullName) (markers not found after patch)"
+    }
+    Write-Host "Verified: $($f.FullName)"
   }
 }
 
-Write-Host "Done."
+Write-Host "All done."
