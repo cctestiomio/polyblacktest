@@ -5,6 +5,8 @@ import {
   ResponsiveContainer, Cell
 } from "recharts";
 
+const WINDOW_SECS = 300;
+
 function clamp(n, lo, hi) {
   const x = Number(n);
   if (!Number.isFinite(x)) return lo;
@@ -12,7 +14,7 @@ function clamp(n, lo, hi) {
 }
 
 function fmtMMSS(sec) {
-  const s = clamp(Math.round(sec), 0, 300);
+  const s = clamp(Math.round(sec), 0, WINDOW_SECS);
   const m = Math.floor(s / 60);
   const r = String(s % 60).padStart(2, "0");
   return `${m}m${r}s`;
@@ -56,12 +58,13 @@ function colorForMetric(sortBy, value) {
 }
 
 export default function BacktestEngine({ sessions }) {
-  // Defaults
   const [buySide, setBuySide] = useState("BOTH"); // UP, DOWN, BOTH
   const [priceMin, setPriceMin] = useState(0.10);
   const [priceMax, setPriceMax] = useState(0.90);
-  const [elapsedMin, setElapsedMin] = useState(0);
-  const [elapsedMax, setElapsedMax] = useState(300);
+
+  // REVERSED: remaining-time filter (not elapsed)
+  const [remainingMin, setRemainingMin] = useState(0);
+  const [remainingMax, setRemainingMax] = useState(WINDOW_SECS);
 
   const [priceStepCents, setPriceStepCents] = useState(5); // 1,5,10
   const [timeStepSecs, setTimeStepSecs] = useState(5);     // 1,5,10
@@ -77,8 +80,9 @@ export default function BacktestEngine({ sessions }) {
   const normalized = useMemo(() => {
     const pMin = clamp(Math.min(priceMin, priceMax), 0, 1);
     const pMax = clamp(Math.max(priceMin, priceMax), 0, 1);
-    const eMin = clamp(Math.min(elapsedMin, elapsedMax), 0, 300);
-    const eMax = clamp(Math.max(elapsedMin, elapsedMax), 0, 300);
+
+    const rMin = clamp(Math.min(remainingMin, remainingMax), 0, WINDOW_SECS);
+    const rMax = clamp(Math.max(remainingMin, remainingMax), 0, WINDOW_SECS);
 
     const ps = ([1,5,10].includes(Number(priceStepCents)) ? Number(priceStepCents) : 5);
     const ts = ([1,5,10].includes(Number(timeStepSecs)) ? Number(timeStepSecs) : 5);
@@ -86,13 +90,14 @@ export default function BacktestEngine({ sessions }) {
     const s = (sortBy === "roi" || sortBy === "pl" || sortBy === "winrate") ? sortBy : "winrate";
 
     return {
-      pMin, pMax, eMin, eMax,
+      pMin, pMax,
+      rMin, rMax,
       ps, ts,
       sortBy: s,
       topN: clamp(topN, 1, 500),
       minSamples: clamp(minSamples, 1, 1000000),
     };
-  }, [priceMin, priceMax, elapsedMin, elapsedMax, priceStepCents, timeStepSecs, sortBy, topN, minSamples]);
+  }, [priceMin, priceMax, remainingMin, remainingMax, priceStepCents, timeStepSecs, sortBy, topN, minSamples]);
 
   const runBacktest = () => {
     const sides = buySide === "BOTH" ? ["UP", "DOWN"] : [buySide];
@@ -110,10 +115,12 @@ export default function BacktestEngine({ sessions }) {
       const points = Array.isArray(session?.priceHistory) ? session.priceHistory : [];
       for (const point of points) {
         const el = point?.elapsed ?? 0;
-        if (el < normalized.eMin || el > normalized.eMax) continue;
 
-        const secElapsed = clamp(Math.round(el), 0, 300);
-        const secRemaining = clamp(300 - secElapsed, 0, 300);
+        const secElapsed = clamp(Math.round(el), 0, WINDOW_SECS);
+        const secRemaining = clamp(WINDOW_SECS - secElapsed, 0, WINDOW_SECS);
+
+        // Apply remaining-time filter here (reversed filter)
+        if (secRemaining < normalized.rMin || secRemaining > normalized.rMax) continue;
 
         for (const s of sides) {
           const price = (s === "DOWN") ? point?.down : point?.up;
@@ -127,7 +134,7 @@ export default function BacktestEngine({ sessions }) {
           const centEnd = Math.min(99, centStart + normalized.ps - 1);
 
           const remStart = Math.floor(secRemaining / normalized.ts) * normalized.ts;
-          const remEnd = Math.min(300, remStart + normalized.ts - 1);
+          const remEnd = Math.min(WINDOW_SECS, remStart + normalized.ts - 1);
 
           const win = outcome === s;
 
@@ -170,17 +177,12 @@ export default function BacktestEngine({ sessions }) {
         const profitIfWinEach = +per.profitIfWinEach.toFixed(2);
         const lossIfLoseEach = +per.lossIfLoseEach.toFixed(2);
 
-        // FIX: scale ProfitIfWin by how many wins happened in this cell.
-        // Example: profitIfWinEach=$15 and wins=4 => ProfitIfWin=$60
+        // Scaled by wins
         const profitIfWin = +(profitIfWinEach * x.wins).toFixed(2);
 
-        // Also show what would have happened historically if you bet every occurrence:
+        // Bet every occurrence
         const realizedPL = +((profitIfWinEach * x.wins) + (lossIfLoseEach * (x.total - x.wins))).toFixed(2);
         const realizedROI = +((realizedPL / (STAKE * x.total)) * 100).toFixed(2);
-
-        // Expected values (per bet * count)
-        const expectedPL = +(((winRate01 * profitIfWinEach) + ((1 - winRate01) * lossIfLoseEach)) * x.total).toFixed(2);
-        const expectedROI = +((expectedPL / (STAKE * x.total)) * 100).toFixed(2);
 
         const likelyOutcome = (winRate01 >= 0.5) ? x.side : opposite(x.side);
 
@@ -203,15 +205,10 @@ export default function BacktestEngine({ sessions }) {
           priceLabel,
           timeLabel,
           winTotal: `${x.wins}/${x.total}`,
-
           profitIfWinEach,
-          profitIfWin,     // scaled by wins (the requested behavior)
+          profitIfWin,
           realizedPL,
           realizedROI,
-
-          expectedPL,
-          expectedROI,
-
           metricVal,
           metricLabel,
           rowLabel: `${x.side} ${priceLabel} @ ${timeLabel}`
@@ -219,19 +216,18 @@ export default function BacktestEngine({ sessions }) {
       });
 
     allRows.sort((a, b) => {
-      if (normalized.sortBy === "roi") {
-        return (b.realizedROI - a.realizedROI) || (b.winRate - a.winRate) || (b.total - a.total);
-      }
-      if (normalized.sortBy === "pl") {
-        return (b.realizedPL - a.realizedPL) || (b.winRate - a.winRate) || (b.total - a.total);
-      }
+      if (normalized.sortBy === "roi") return (b.realizedROI - a.realizedROI) || (b.winRate - a.winRate) || (b.total - a.total);
+      if (normalized.sortBy === "pl") return (b.realizedPL - a.realizedPL) || (b.winRate - a.winRate) || (b.total - a.total);
       return (b.winRate - a.winRate) || (b.total - a.total) || (a.remStart - b.remStart) || (a.centStart - b.centStart);
     });
 
+    const rows = allRows.slice(0, normalized.topN);
+    const chartRows = allRows.slice(0, Math.min(30, normalized.topN));
+
     setResults({
       summary: { total: tradesCount, wins: winsCount, winRate: winsCount / tradesCount },
-      rows: allRows.slice(0, normalized.topN),
-      chartRows: allRows.slice(0, Math.min(30, normalized.topN)),
+      rows,
+      chartRows,
       debug: { trades: tradesCount, cells: cells.size, priceStep: normalized.ps, timeStep: normalized.ts, sortBy: normalized.sortBy }
     });
   };
@@ -273,17 +269,17 @@ export default function BacktestEngine({ sessions }) {
           </div>
 
           <div>
-            <label className="text-xs text-[var(--text2)] block mb-1">Time Elapsed Range filter (seconds 0-300)</label>
+            <label className="text-xs text-[var(--text2)] block mb-1">Time Remaining Range filter (seconds 0-300)</label>
             <div className="flex gap-2 items-center">
-              <input type="number" min="0" max="300" step="1" value={elapsedMin}
-                onChange={e => setElapsedMin(+e.target.value)}
+              <input type="number" min="0" max="300" step="1" value={remainingMin}
+                onChange={e => setRemainingMin(+e.target.value)}
                 className="w-24 bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-1.5 text-sm text-[var(--text1)]" />
               <span className="text-[var(--text3)]">to</span>
-              <input type="number" min="0" max="300" step="1" value={elapsedMax}
-                onChange={e => setElapsedMax(+e.target.value)}
+              <input type="number" min="0" max="300" step="1" value={remainingMax}
+                onChange={e => setRemainingMax(+e.target.value)}
                 className="w-24 bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-1.5 text-sm text-[var(--text1)]" />
             </div>
-            <p className="text-xs text-[var(--text3)] mt-1">Best-combos uses time remaining (300 - elapsed).</p>
+            <p className="text-xs text-[var(--text3)] mt-1">This filter is applied to remaining time (300 - elapsed).</p>
           </div>
 
           <div>
@@ -335,99 +331,86 @@ export default function BacktestEngine({ sessions }) {
           className="w-full py-3 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-xl font-bold text-base">
           Run Backtest ({sessions.length} session{sessions.length !== 1 ? "s" : ""} loaded)
         </button>
-
-        <p className="text-xs text-[var(--text3)]">
-          Profit numbers assume $10 stake per occurrence, shares=10/avgPrice, payout $1 if correct, $0 if wrong (fees ignored).
-        </p>
       </div>
 
-      {results && (
-        <div className="space-y-4">
-          {results.summary ? (
-            <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-4 shadow-sm">
-              <p className="text-sm font-bold mb-2">Best price + time combos (sorted by selected metric)</p>
+      {results && results.summary && (
+        <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-4 shadow-sm space-y-4">
+          <p className="text-sm font-bold">Best price + time combos (sorted by selected metric)</p>
 
-              <div className="overflow-x-auto">
-                <table className="w-full text-xs text-[var(--text1)]">
-                  <thead>
-                    <tr className="text-[var(--text3)] border-b border-[var(--border)]">
-                      <th className="text-left py-1 pr-4">Side</th>
-                      <th className="text-right pr-4">Price bucket</th>
-                      <th className="text-right pr-4">Avg price</th>
-                      <th className="text-right pr-4">Time remaining</th>
-                      <th className="text-right pr-4">WinRate</th>
-                      <th className="text-right pr-4">Win/Total</th>
-                      <th className="text-right pr-4">ProfitIfWin</th>
-                      <th className="text-right pr-4">RealizedPL</th>
-                      <th className="text-right pr-4">RealizedROI%</th>
-                      <th className="text-right">Likely</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {results.rows.map((r, i) => (
-                      <tr key={i} className="border-b border-[var(--border)] hover:bg-[var(--bg2)]">
-                        <td className={`py-1 pr-4 font-bold ${r.side === "UP" ? "text-green-600" : "text-red-600"}`}>{r.side}</td>
-                        <td className="text-right pr-4">{r.priceLabel}</td>
-                        <td className="text-right pr-4">{r.avgPriceLabel}</td>
-                        <td className="text-right pr-4">{r.timeLabel}</td>
-                        <td className="text-right pr-4">{r.winRate}%</td>
-                        <td className="text-right pr-4">{r.winTotal}</td>
-                        <td className="text-right pr-4">${r.profitIfWin.toFixed(2)}</td>
-                        <td className={`text-right pr-4 font-bold ${r.realizedPL >= 0 ? "text-green-600" : "text-red-600"}`}>${r.realizedPL.toFixed(2)}</td>
-                        <td className={`text-right pr-4 font-bold ${r.realizedROI >= 0 ? "text-green-600" : "text-red-600"}`}>{r.realizedROI.toFixed(2)}%</td>
-                        <td className="text-right font-bold">{r.likelyOutcome}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs text-[var(--text1)]">
+              <thead>
+                <tr className="text-[var(--text3)] border-b border-[var(--border)]">
+                  <th className="text-left py-1 pr-4">Side</th>
+                  <th className="text-right pr-4">Price bucket</th>
+                  <th className="text-right pr-4">Avg price</th>
+                  <th className="text-right pr-4">Time remaining</th>
+                  <th className="text-right pr-4">WinRate</th>
+                  <th className="text-right pr-4">Win/Total</th>
+                  <th className="text-right pr-4">ProfitIfWin</th>
+                  <th className="text-right pr-4">RealizedPL</th>
+                  <th className="text-right pr-4">RealizedROI%</th>
+                  <th className="text-right">Likely</th>
+                </tr>
+              </thead>
+              <tbody>
+                {results.rows.map((r, i) => (
+                  <tr key={i} className="border-b border-[var(--border)] hover:bg-[var(--bg2)]">
+                    <td className={`py-1 pr-4 font-bold ${r.side === "UP" ? "text-green-600" : "text-red-600"}`}>{r.side}</td>
+                    <td className="text-right pr-4">{r.priceLabel}</td>
+                    <td className="text-right pr-4">{r.avgPriceLabel}</td>
+                    <td className="text-right pr-4">{r.timeLabel}</td>
+                    <td className="text-right pr-4">{r.winRate}%</td>
+                    <td className="text-right pr-4">{r.winTotal}</td>
+                    <td className="text-right pr-4">${r.profitIfWin.toFixed(2)}</td>
+                    <td className={`text-right pr-4 font-bold ${r.realizedPL >= 0 ? "text-green-600" : "text-red-600"}`}>${r.realizedPL.toFixed(2)}</td>
+                    <td className={`text-right pr-4 font-bold ${r.realizedROI >= 0 ? "text-green-600" : "text-red-600"}`}>{r.realizedROI.toFixed(2)}%</td>
+                    <td className="text-right font-bold">{r.likelyOutcome}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
 
-              <div className="mt-4 bg-[var(--bg2)] border border-[var(--border)] rounded-xl p-3" style={{ height: chartHeight }}>
-                <p className="text-xs text-[var(--text2)] mb-2">Top combos chart (metric: {results.chartRows?.[0]?.metricLabel ?? "WinRate"})</p>
+          <div className="bg-[var(--bg2)] border border-[var(--border)] rounded-xl p-3" style={{ height: chartHeight }}>
+            <p className="text-xs text-[var(--text2)] mb-2">Top combos chart (metric: {results.chartRows?.[0]?.metricLabel ?? "WinRate"})</p>
+            <ResponsiveContainer width="100%" height="92%">
+              <BarChart data={(results.chartRows ?? []).slice().reverse()} layout="vertical" margin={{ left: 10, right: 20, top: 10, bottom: 10 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+                <XAxis
+                  type="number"
+                  stroke="#94a3b8"
+                  tick={{ fontSize: 11 }}
+                  tickFormatter={(v) => {
+                    if (normalized.sortBy === "winrate") return `${v}%`;
+                    if (normalized.sortBy === "roi") return `${v}%`;
+                    return `$${v}`;
+                  }}
+                />
+                <YAxis type="category" dataKey="rowLabel" width={260} stroke="#94a3b8" tick={{ fontSize: 10 }} />
+                <Tooltip
+                  formatter={(v, n, ctx) => {
+                    const p = ctx?.payload;
+                    if (!p) return [v, n];
+                    return [
+                      `${p.metricLabel}=${p.metricVal}, winRate=${p.winRate}%, win/total=${p.winTotal}, profitIfWin=$${p.profitIfWin}, realizedPL=$${p.realizedPL}`,
+                      "Combo"
+                    ];
+                  }}
+                  contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 8 }}
+                />
+                <Bar dataKey="metricVal" radius={[4,4,4,4]}>
+                  {(results.chartRows ?? []).slice().reverse().map((e, i) => (
+                    <Cell key={i} fill={colorForMetric(normalized.sortBy, e.metricVal)} />
+                  ))}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
 
-                <ResponsiveContainer width="100%" height="92%">
-                  <BarChart data={(results.chartRows ?? []).slice().reverse()} layout="vertical" margin={{ left: 10, right: 20, top: 10, bottom: 10 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-                    <XAxis
-                      type="number"
-                      stroke="#94a3b8"
-                      tick={{ fontSize: 11 }}
-                      tickFormatter={(v) => {
-                        if (normalized.sortBy === "winrate") return `${v}%`;
-                        if (normalized.sortBy === "roi") return `${v}%`;
-                        return `$${v}`;
-                      }}
-                    />
-                    <YAxis type="category" dataKey="rowLabel" width={260} stroke="#94a3b8" tick={{ fontSize: 10 }} />
-                    <Tooltip
-                      formatter={(v, n, ctx) => {
-                        const p = ctx?.payload;
-                        if (!p) return [v, n];
-                        return [
-                          `${p.metricLabel}=${p.metricVal}, winRate=${p.winRate}%, win/total=${p.winTotal}, profitIfWinEach=$${p.profitIfWinEach}, profitIfWin=$${p.profitIfWin}, realizedPL=$${p.realizedPL}`,
-                          "Combo"
-                        ];
-                      }}
-                      contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 8 }}
-                    />
-                    <Bar dataKey="metricVal" radius={[4,4,4,4]}>
-                      {(results.chartRows ?? []).slice().reverse().map((e, i) => (
-                        <Cell key={i} fill={colorForMetric(normalized.sortBy, e.metricVal)} />
-                      ))}
-                    </Bar>
-                  </BarChart>
-                </ResponsiveContainer>
-              </div>
-
-              <div className="text-xs text-[var(--text3)] mt-3">
-                Note: ProfitIfWin is scaled by wins (profit per bet times wins). RealizedPL includes losses too (bet every occurrence).
-              </div>
-            </div>
-          ) : (
-            <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-6 text-center text-[var(--text3)]">
-              No matching trades.
-            </div>
-          )}
+          <div className="text-xs text-[var(--text3)]">
+            Debug: trades={results.debug?.trades ?? 0}, cells={results.debug?.cells ?? 0}, priceStep={results.debug?.priceStep ?? "?"}c, timeStep={results.debug?.timeStep ?? "?"}s, sortBy={results.debug?.sortBy ?? "?"}
+          </div>
         </div>
       )}
     </div>
