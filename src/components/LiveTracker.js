@@ -31,7 +31,7 @@ export default function LiveTracker({ onSaveSession }) {
   const [wsState,      setWsState]      = useState("disconnected"); 
 
   const wsRef        = useRef(null);
-  const tickRef      = useRef(null);   
+  const workerRef    = useRef(null);
   const resTimeoutRef = useRef(null);
 const clockTickFnRef = useRef(null);
 const cdRef        = useRef(null);   
@@ -43,13 +43,24 @@ const cdRef        = useRef(null);
   const savedRef     = useRef(false);
   const startFnRef   = useRef(null);
 
+  useEffect(() => {
+    workerRef.current = new Worker("/worker.js");
+    workerRef.current.onmessage = (e) => {
+      if (e.data === "tick" && clockTickFnRef.current) {
+        clockTickFnRef.current();
+      }
+    };
+    return () => {
+      workerRef.current.terminate();
+    };
+  }, []);
+
   // -- stop everything --------------------------------------------------------
   const stopAll = useCallback(() => {
-    clearInterval(tickRef.current);
+    workerRef.current?.postMessage("stop");
     clearInterval(cdRef.current);
     clearTimeout(resTimeoutRef.current);
     resTimeoutRef.current = null;
-tickRef.current = null;
     cdRef.current   = null;
     if (wsRef.current) {
       wsRef.current.onclose = null; 
@@ -135,8 +146,11 @@ tickRef.current = null;
     const slugTs = slugTsRef.current;
     if (slugTs == null) return;
 
-    const el  = getSecondsElapsed(slugTs);
-    const rem = getSecondsRemaining(slugTs);
+    const now = Date.now();
+    const elapsedMs = now - slugTs * 1000;
+    const el = Math.min(300, Math.max(0, elapsedMs / 1000));
+    const rem = Math.max(0, 300 - el);
+
     setElapsed(el);
     setRemaining(rem);
 
@@ -144,7 +158,7 @@ tickRef.current = null;
     // Only record if we have data or preserve previous
     const lastP = historyRef.current[historyRef.current.length - 1];
     const point = { 
-      t: Math.floor(Date.now() / 1000), 
+      t: now,
       elapsed: el, 
       up: up ?? lastP?.up, 
       down: down ?? lastP?.down 
@@ -156,8 +170,7 @@ tickRef.current = null;
 
     // -- MARKET FINISHED --
     if (rem <= 0) {
-      clearInterval(tickRef.current);
-      tickRef.current = null;
+      workerRef.current?.postMessage("stop");
       
       // Close WS immediately
       if (wsRef.current) { wsRef.current.onclose = null; wsRef.current.close(); wsRef.current = null; }
@@ -279,7 +292,7 @@ const slug = slugOverride ?? getMarketSlug(slugTs);
 
     openWs(ids.upId, ids.downId);
 
-    tickRef.current = setInterval(clockTick, 1000);
+    workerRef.current?.postMessage("start");
     clockTick(); 
   }, [stopAll, openWs, clockTick, scheduleResolution]);
 
