@@ -1,4 +1,5 @@
-import json, math, time, os, sys, threading
+﻿import json, math, time, os, sys, threading, argparse
+from datetime import datetime
 
 try:
     import requests
@@ -17,17 +18,7 @@ retry = Retry(total=3, backoff_factor=0.3, status_forcelist=[500,502,503,504])
 http.mount("https://", HTTPAdapter(max_retries=retry))
 
 GAMMA  = "https://gamma-api.polymarket.com"
-CLOB   = "https://clob.polymarket.com"
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-
-def current_slug_ts():
-    return math.floor(time.time() / 300) * 300
-
-def resolution_ts(slug_ts):
-    return slug_ts + 300
-
-def market_slug(slug_ts):
-    return f"btc-updown-5m-{slug_ts}"
 
 def fetch_market(slug):
     try:
@@ -36,31 +27,43 @@ def fetch_market(slug):
         data = r.json()
         m = data[0] if isinstance(data, list) and data else data
         if not m: return None
+        
         raw = m.get("clobTokenIds", "[]")
         token_ids = json.loads(raw) if isinstance(raw, str) else raw
         outcomes  = m.get("outcomes", [])
         if isinstance(outcomes, str): outcomes = json.loads(outcomes)
-        up_id, down_id = None, None
-        for i, o in enumerate(outcomes):
-            if o.lower() in ("up","yes")   and i < len(token_ids): up_id   = str(token_ids[i])
-            if o.lower() in ("down","no")  and i < len(token_ids): down_id = str(token_ids[i])
-        if not up_id   and len(token_ids) > 0: up_id   = str(token_ids[0])
-        if not down_id and len(token_ids) > 1: down_id = str(token_ids[1])
+        
+        tokens_info = []
+        for i, tid in enumerate(token_ids):
+            name = outcomes[i] if i < len(outcomes) else f"Token_{i}"
+            tokens_info.append({"id": str(tid), "name": name})
 
-        # Check if already resolved
         winner = None
         for t in m.get("tokens", []):
             if t.get("winner"):
-                winner = t.get("outcome","").upper()
+                winner = t.get("outcome", "").upper()
                 break
+
+        # Parse endDate to get resolution timestamp
+        end_date_str = m.get("endDate")
+        res_ts = 0
+        if end_date_str:
+            try:
+                clean_date = end_date_str.split(".")[0].replace("Z", "")
+                res_ts = int(datetime.strptime(clean_date, "%Y-%m-%dT%H:%M:%S").timestamp())
+            except Exception:
+                pass
+        
+        if not res_ts:
+            res_ts = int(time.time()) + 3600 # Fallback 1 hour if no end date
 
         return {
             "slug": m.get("slug", slug),
             "question": m.get("question",""),
-            "up_id":  up_id,
-            "down_id": down_id,
+            "tokens": tokens_info,
             "closed": m.get("closed", False),
             "winner": winner,
+            "res_ts": res_ts
         }
     except Exception as e:
         print(f"\n  [ERROR] fetch_market: {e}")
@@ -74,9 +77,8 @@ def poll_gamma_outcome(slug, max_attempts=20, interval=3):
             m = fetch_market(slug)
             if m and m.get("closed") and m.get("winner"):
                 w = m["winner"].upper()
-                if w in ("UP","DOWN"):
-                    print(f" -> {w}")
-                    return w
+                print(f" -> {w}")
+                return w
         except Exception: pass
         print(".", end="", flush=True)
     print(" timed out")
@@ -98,33 +100,31 @@ def save_session(sd, output_dir="."):
     with open(fn, "w") as f: json.dump(sd, f, indent=2)
     return fn
 
-def track_market(slug_ts):
-    slug   = market_slug(slug_ts)
-    res_ts = resolution_ts(slug_ts)
-
-    print(f"\n{'='*60}")
-    print(f"  Slug     : {slug}")
-    print(f"  Resolves : {res_ts}")
-    print(f"{'='*60}")
-
+def track_market(slug):
+    print(f"\n{'='*70}")
+    print(f"  Fetching : {slug}")
     m = fetch_market(slug)
     if not m:
-        print("  [SKIP] Not found"); return None
+        print("  [SKIP] Market not found"); return None
+        
+    print(f"  Question : {m['question']}")
+    print(f"  Tokens   : {', '.join([t['name'] for t in m['tokens']])}")
+    print(f"{'='*70}")
+
     if m.get("closed") and m.get("winner"):
         print(f"  Already resolved: {m['winner']}")
         return None
 
-    up_id, down_id = m["up_id"], m["down_id"]
-    print(f"  UP   token: {up_id}")
-    print(f"  DOWN token: {down_id}\n")
-    if not up_id:
-        print("  [ERROR] No UP token"); return None
+    tokens = m["tokens"]
+    if not tokens:
+        print("  [ERROR] No tokens found"); return None
 
-    sd = {"slug": slug, "slugTs": slug_ts, "resolutionTs": res_ts,
+    res_ts = m["res_ts"]
+    sd = {"slug": slug, "resolutionTs": res_ts,
           "question": m["question"], "outcome": None, "priceHistory": []}
 
-    # ── WebSocket price feed ───────────────────────────────────────────────
-    prices = {"up": None, "down": None}
+    # Setup price tracking for all token IDs dynamically
+    prices = {t["id"]: None for t in tokens}
     ws_lock = threading.Lock()
     done_event = threading.Event()
 
@@ -138,21 +138,18 @@ def track_market(slug_ts):
                 if not asset or price is None: continue
                 p = float(price)
                 if not (0.001 < p < 0.999): continue
+                
                 with ws_lock:
-                    if asset == up_id:
-                        prices["up"]   = round(p, 6)
-                        prices["down"] = round(1-p, 6)
-                    elif asset == down_id:
-                        prices["down"] = round(p, 6)
-                        prices["up"]   = round(1-p, 6)
+                    if asset in prices:
+                        prices[asset] = round(p, 6)
         except Exception: pass
 
     def on_ws_open(ws):
-        sub = json.dumps({"assets_ids": [x for x in [up_id, down_id] if x], "type": "Market"})
+        sub = json.dumps({"assets_ids": [t["id"] for t in tokens], "type": "Market"})
         ws.send(sub)
 
     def on_ws_error(ws, err):
-        print(f"\n  [WS ERROR] {err}")
+        pass # Suppress noisy WS errors in console
 
     def run_ws():
         while not done_event.is_set():
@@ -161,76 +158,80 @@ def track_market(slug_ts):
                     on_open=on_ws_open, on_message=on_ws_message, on_error=on_ws_error)
                 ws.run_forever(ping_interval=20, ping_timeout=10)
             except Exception as e:
-                print(f"\n  [WS] reconnecting ({e})")
+                pass
             if not done_event.is_set(): time.sleep(2)
 
     ws_thread = threading.Thread(target=run_ws, daemon=True)
     ws_thread.start()
 
     last_save = time.time()
+    start_time = int(time.time())
 
     while True:
         now       = int(time.time())
         remaining = max(0, res_ts - now)
-        elapsed   = min(300, 300 - remaining)
+        elapsed   = now - start_time
 
         with ws_lock:
-            up_price   = prices["up"]
-            down_price = prices["down"]
+            current_prices = dict(prices)
 
-        point = {"t": now, "elapsed": elapsed, "up": up_price, "down": down_price}
+        point = {"t": now, "elapsed": elapsed}
+        # Add all token prices to the history point
+        for t in tokens:
+            point[t["name"]] = current_prices[t["id"]]
+            
         sd["priceHistory"].append(point)
 
-        up_str   = f"{up_price:.4f}"   if up_price   is not None else "NULL"
-        down_str = f"{down_price:.4f}" if down_price is not None else "NULL"
-        bar = chr(9608) * int((elapsed/300)*20)
-        print(f"\r  [{bar:<20}] {elapsed:>3}s  UP={up_str}  DOWN={down_str}  pts={len(sd['priceHistory'])}  rem={remaining}s   ",
-              end="", flush=True)
+        # Format price strings for console
+        price_strs = []
+        for t in tokens:
+            p = current_prices[t["id"]]
+            p_str = f"{p:.3f}" if p is not None else "---"
+            price_strs.append(f"{t['name'][:8]}={p_str}")
+        
+        p_line = "  ".join(price_strs)
+        print(f"\r  [{elapsed:>4}s] {p_line} | pts={len(sd['priceHistory'])} rem={remaining}s   ", end="", flush=True)
 
         if time.time() - last_save >= 30:
             save_session(sd); last_save = time.time()
 
         if remaining <= 0:
             print()
-            done_event.set()  # stop WS thread
+            done_event.set()
             outcome = poll_gamma_outcome(slug)
             if not outcome:
-                ans = input("  Manual u=UP / d=DOWN / Enter skip: ").strip().lower()
-                if ans in ("u","up"):     outcome = "UP"
-                elif ans in ("d","down"): outcome = "DOWN"
+                ans = input(f"  Manual Outcome (Enter to skip): ").strip()
+                if ans: outcome = ans.upper()
             if outcome: sd["outcome"] = outcome
             break
 
         time.sleep(1)
 
     fn = save_session(sd)
-    ok = sum(1 for p in sd["priceHistory"] if p["up"] is not None)
-    print(f"  Saved: {fn}  ({len(sd['priceHistory'])} pts, {ok} priced)")
+    print(f"  Saved: {fn}")
     return sd
 
 def main():
-    import argparse
-    p = argparse.ArgumentParser()
-    p.add_argument("--slug")
+    p = argparse.ArgumentParser(description="Universal Polymarket Tracker")
+    p.add_argument("market", nargs="?", help="Market slug or full URL")
     args = p.parse_args()
 
-    if args.slug:
-        ts_str = args.slug.replace("btc-updown-5m-","")
-        try: slug_ts = int(ts_str)
-        except: print("Bad slug"); return
-        track_market(slug_ts); return
+    if not args.market:
+        market_input = input("Enter Polymarket slug or full URL: ").strip()
+    else:
+        market_input = args.market
 
-    print("Polymarket BTC 5m Tracker (WebSocket) -- Ctrl+C to stop\n")
-    while True:
-        slug_ts = current_slug_ts()
-        res_ts  = resolution_ts(slug_ts)
-        remaining = max(0, res_ts - int(time.time()))
-        if remaining <= 0:
-            time.sleep(2); continue
-        track_market(slug_ts)
-        print("\nWaiting 3s for next market...\n")
-        time.sleep(3)
+    if not market_input:
+        print("No market provided. Exiting.")
+        return
+
+    # Extract the slug if a full URL was pasted
+    slug = market_input.split("/")[-1] if "/" in market_input else market_input
+    
+    try:
+        track_market(slug)
+    except KeyboardInterrupt:
+        print("\n\nStopped.")
 
 if __name__ == "__main__":
-    try: main()
-    except KeyboardInterrupt: print("\n\nStopped.")
+    main()
